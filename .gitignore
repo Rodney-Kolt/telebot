@@ -1,5 +1,6 @@
 venv/
 __pycache__/
+render.env
 *.pyc
 *.pyo
 .env
