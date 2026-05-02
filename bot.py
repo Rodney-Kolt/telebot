@@ -6,6 +6,7 @@ import logging
 import math
 import httpx
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -35,34 +36,34 @@ TOKEN = os.environ.get("BOT_TOKEN")
 if not TOKEN:
     raise ValueError("No BOT_TOKEN environment variable set")
 
-CHAT_ID = os.environ.get("CHAT_ID")
 IS_RENDER = os.environ.get("RENDER") == "true"
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
-# SSID: full 42["auth",{...}] string from browser DevTools
-# Can be updated at runtime by SessionManager when a fresh one is provided
-SSID = os.environ.get("SSID", "")
-if not SSID:
-    raise ValueError("SSID environment variable not set")
-
-PO_DEMO = int(os.environ.get("PO_DEMO", "1"))  # 1 = demo, 0 = real
-
 # Signal photo URLs — override with env vars on Render, or use built-in defaults.
-# To use your own images: set SIGNAL_IMG_BUY and SIGNAL_IMG_SELL on Render dashboard.
 _DEFAULT_IMG_BUY  = "https://i.ibb.co/HDC7G1D0/image.jpg"   # BUY (CALL) image
 _DEFAULT_IMG_SELL = "https://i.ibb.co/YTfbPc72/image.jpg"   # SELL (PUT) image
 
 SIGNAL_IMG_BUY  = os.environ.get("SIGNAL_IMG_BUY",  "").strip() or _DEFAULT_IMG_BUY
 SIGNAL_IMG_SELL = os.environ.get("SIGNAL_IMG_SELL", "").strip() or _DEFAULT_IMG_SELL
 
-TRADE_ASSET  = "EURUSD_otc"
-CANDLE_PERIOD = 60   # seconds for the auto-signal loop
-CANDLE_COUNT  = 50   # candles to fetch (enough for RSI-14 + EMA-20)
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+TRADE_ASSET   = "EURUSD_otc"
+CANDLE_PERIOD = 60    # seconds for the auto-signal loop
+CANDLE_COUNT  = 50    # candles to fetch (enough for RSI-14 + EMA-20)
+
+PREEMPTIVE_REFRESH_HOURS = 23   # reconnect before the 24-h session boundary
+PING_INTERVAL_SECONDS    = 20   # keep-alive ping cadence
+SIGNAL_EXPIRY_SEC        = 600  # 10 minutes
+STATS_FILE               = "stats.json"
+
+# ConversationHandler states
+CHOOSE_ASSET, CHOOSE_TIME = range(2)
 
 # ---------------------------------------------------------------------------
 # Asset catalogue
 # ---------------------------------------------------------------------------
-# Maps display label → Pocket Option asset code
 ASSETS: dict[str, str] = {
     "EUR/USD (OTC)": "EURUSD_otc",
     "AUD/USD (OTC)": "AUDUSD_otc",
@@ -72,7 +73,6 @@ ASSETS: dict[str, str] = {
     "EUR/JPY (OTC)": "EURJPY_otc",
 }
 
-# Maps display label → candle timeframe in seconds
 TIMEFRAMES: dict[str, int] = {
     "5 seconds":  5,
     "1 minute":   60,
@@ -80,36 +80,121 @@ TIMEFRAMES: dict[str, int] = {
     "5 minutes":  300,
 }
 
-# ConversationHandler states
-CHOOSE_ASSET, CHOOSE_TIME = range(2)
-
-# ---------------------------------------------------------------------------
-# Per-user settings  {user_id: {"asset": label, "timeframe": label, "auto": bool}}
-# ---------------------------------------------------------------------------
-user_settings: dict[int, dict] = {}
-
 DEFAULT_SETTINGS = {
     "asset":     "EUR/USD (OTC)",
     "timeframe": "1 minute",
-    "auto":      False,         # auto-signals OFF by default; user must opt in
+    "auto":      False,
 }
 
-# Registry of all users who have ever sent /start — used for auto-broadcasts
-known_users: set[int] = set()
+# Error substrings that indicate the SSID is dead and needs manual refresh
+_AUTH_ERROR_MARKERS = (
+    "authentication timeout",
+    "websocket connection closed",
+    "unauthorized",
+    "token expired",
+    "connect() returned false",
+    "failed to connect",
+)
 
 # ---------------------------------------------------------------------------
-# Win/Loss tracking
+# Config loading
 # ---------------------------------------------------------------------------
-STATS_FILE        = "stats.json"
-SIGNAL_EXPIRY_SEC = 600   # 10 minutes
 
-# Per-user stats: {user_id: {"total": int, "wins": int, "losses": int, "last_5": list}}
+def _load_user_configs() -> list[dict]:
+    """
+    Parse USERS_CONFIG env var (JSON array) or fall back to single-user SSID+CHAT_ID.
+    Returns list of dicts: [{"name": str, "chat_id": int, "ssid": str, "is_demo": bool}]
+    """
+    raw = os.environ.get("USERS_CONFIG", "").strip()
+    if raw:
+        try:
+            configs = json.loads(raw)
+            result = []
+            for c in configs:
+                result.append({
+                    "name":    c.get("name", f"User_{c['chat_id']}"),
+                    "chat_id": int(c["chat_id"]),
+                    "ssid":    c["ssid"],
+                    "is_demo": bool(int(c.get("is_demo", 1))),
+                })
+            logger.info(f"Loaded {len(result)} users from USERS_CONFIG")
+            return result
+        except Exception as exc:
+            logger.error(f"Failed to parse USERS_CONFIG: {exc}")
+
+    # Single-user fallback
+    ssid    = os.environ.get("SSID", "")
+    chat_id = os.environ.get("CHAT_ID", "")
+    if ssid and chat_id:
+        logger.info("Using single-user fallback (SSID + CHAT_ID)")
+        return [{
+            "name":    "Default",
+            "chat_id": int(chat_id),
+            "ssid":    ssid,
+            "is_demo": bool(int(os.environ.get("PO_DEMO", "1"))),
+        }]
+
+    raise ValueError("No user config found. Set USERS_CONFIG or SSID+CHAT_ID env vars.")
+
+# ---------------------------------------------------------------------------
+# UserSession dataclass
+# ---------------------------------------------------------------------------
+
+@dataclass
+class UserSession:
+    name:     str
+    chat_id:  int
+    ssid:     str
+    is_demo:  bool
+
+    # Created after init
+    session_manager: "SessionManager | None" = field(default=None, repr=False)
+    settings: dict = field(default_factory=lambda: dict(DEFAULT_SETTINGS))
+    latest_signal: dict = field(default_factory=lambda: {
+        "direction": None, "price": None, "reason": None, "timestamp": None
+    })
+    poll_task: "asyncio.Task | None" = field(default=None, repr=False)
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+# Registry of all active user sessions, keyed by chat_id
+user_registry: dict[int, UserSession] = {}
+
+# Win/loss tracking (keyed by chat_id)
 user_stats: dict[int, dict] = {}
-
-# Pending signals awaiting a vote:
-# {signal_id: {"user_id": int, "ts": float, "voted": bool}}
 pending_signals: dict[str, dict] = {}
 
+# Per-user Telegram settings (for users not in user_registry, e.g. menu state)
+user_settings: dict[int, dict] = {}
+
+# Recent errors
+recent_errors: list[str] = []
+MAX_ERRORS = 20
+
+# ---------------------------------------------------------------------------
+# Error logging
+# ---------------------------------------------------------------------------
+
+def log_error(msg: str) -> None:
+    ts = datetime.now().strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    logger.error(msg)
+    recent_errors.append(entry)
+    if len(recent_errors) > MAX_ERRORS:
+        recent_errors.pop(0)
+
+# ---------------------------------------------------------------------------
+# Helper to get user session
+# ---------------------------------------------------------------------------
+
+def _get_user_session(chat_id: int) -> "UserSession | None":
+    return user_registry.get(chat_id)
+
+# ---------------------------------------------------------------------------
+# Stats helpers
+# ---------------------------------------------------------------------------
 
 def _load_stats() -> None:
     """Load persisted stats from stats.json on startup."""
@@ -118,7 +203,6 @@ def _load_stats() -> None:
         if os.path.exists(STATS_FILE):
             with open(STATS_FILE, "r", encoding="utf-8") as f:
                 raw = json.load(f)
-            # Keys are stored as strings in JSON; convert back to int
             user_stats = {int(k): v for k, v in raw.items()}
             logger.info(f"Loaded stats for {len(user_stats)} users from {STATS_FILE}")
     except Exception as exc:
@@ -142,14 +226,14 @@ def _get_stats(user_id: int) -> dict:
 
 def _record_vote(user_id: int, won: bool) -> None:
     s = _get_stats(user_id)
-    s["total"]  += 1
+    s["total"] += 1
     if won:
         s["wins"] += 1
-        s["last_5"].append("👍")
+        s["last_5"].append("\U0001f44d")
     else:
         s["losses"] += 1
-        s["last_5"].append("👎")
-    s["last_5"] = s["last_5"][-5:]   # keep only last 5
+        s["last_5"].append("\U0001f44e")
+    s["last_5"] = s["last_5"][-5:]
     _save_stats()
 
 
@@ -160,50 +244,19 @@ def _make_signal_id(user_id: int) -> str:
 
 def _vote_keyboard(signal_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("👍 Win",  callback_data=f"vote:win:{signal_id}"),
-        InlineKeyboardButton("👎 Loss", callback_data=f"vote:loss:{signal_id}"),
+        InlineKeyboardButton("\U0001f44d Win",  callback_data=f"vote:win:{signal_id}"),
+        InlineKeyboardButton("\U0001f44e Loss", callback_data=f"vote:loss:{signal_id}"),
     ]])
 
+
 # ---------------------------------------------------------------------------
-# Global signal state
+# Telegram app (created early so SessionManager can reference it)
 # ---------------------------------------------------------------------------
-latest_signal: dict = {
-    "direction": None,
-    "price":     None,
-    "reason":    None,
-    "timestamp": None,
-}
-
-# Recent error log (shown by /logs command)
-recent_errors: list[str] = []
-MAX_ERRORS = 20
-
-
-def log_error(msg: str) -> None:
-    ts = datetime.now().strftime("%H:%M:%S")
-    entry = f"[{ts}] {msg}"
-    logger.error(msg)
-    recent_errors.append(entry)
-    if len(recent_errors) > MAX_ERRORS:
-        recent_errors.pop(0)
-
+telegram_app = Application.builder().token(TOKEN).build()
 
 # ---------------------------------------------------------------------------
 # SessionManager
 # ---------------------------------------------------------------------------
-# Error substrings that indicate the SSID is dead and needs manual refresh
-_AUTH_ERROR_MARKERS = (
-    "authentication timeout",
-    "websocket connection closed",
-    "unauthorized",
-    "token expired",
-    "connect() returned false",
-    "failed to connect",
-)
-
-PREEMPTIVE_REFRESH_HOURS = 23   # reconnect before the 24-h session boundary
-PING_INTERVAL_SECONDS    = 20   # keep-alive ping cadence
-
 
 class SessionManager:
     """
@@ -218,9 +271,12 @@ class SessionManager:
                               itself needs a manual update.
     """
 
-    def __init__(self, ssid: str, is_demo: bool = True) -> None:
+    def __init__(self, ssid: str, is_demo: bool = True,
+                 chat_id: int = 0, name: str = "Unknown") -> None:
         self.ssid:        str  = ssid
         self.is_demo:     bool = is_demo
+        self.chat_id:     int  = chat_id
+        self.name:        str  = name
         self.client:      "AsyncPocketOptionClient | None" = None
         self.connected_at: "datetime | None" = None
 
@@ -252,10 +308,10 @@ class SessionManager:
             try:
                 await self.client.disconnect()
             except Exception as exc:
-                logger.warning(f"SessionManager.stop disconnect error: {exc}")
+                logger.warning(f"[{self.name}] SessionManager.stop disconnect error: {exc}")
         self.client = None
         self.connected_at = None
-        logger.info("SessionManager stopped.")
+        logger.info(f"[{self.name}] SessionManager stopped.")
 
     async def get_candles(self, **kwargs):
         """Proxy to client.get_candles; triggers reconnect on failure."""
@@ -283,7 +339,6 @@ class SessionManager:
 
     async def _connect(self) -> bool:
         """(Re)create client and connect. Must be called under self._lock."""
-        # Tear down any existing client first
         if self.client:
             try:
                 await self.client.disconnect()
@@ -296,25 +351,24 @@ class SessionManager:
                 ssid=self.ssid,
                 is_demo=self.is_demo,
             )
-            logger.info("SessionManager: connecting to Pocket Option...")
+            logger.info(f"[{self.name}] SessionManager: connecting to Pocket Option...")
             connected = await self.client.connect()
         except Exception as exc:
-            log_error(f"SessionManager connect exception: {exc}")
+            log_error(f"[{self.name}] SessionManager connect exception: {exc}")
             self.client = None
             return False
 
         if not connected:
-            log_error("SessionManager: connect() returned False — SSID may be expired")
+            log_error(f"[{self.name}] SessionManager: connect() returned False — SSID may be expired")
             self.client = None
             return False
 
         self.connected_at = datetime.now()
-        logger.info(f"SessionManager: connected at {self.connected_at.strftime('%H:%M:%S')}")
+        logger.info(f"[{self.name}] SessionManager: connected at {self.connected_at.strftime('%H:%M:%S')}")
 
-        # (Re)launch background tasks
         self._cancel_tasks()
-        self._ping_task    = asyncio.create_task(self._ping_loop(),    name="po_ping")
-        self._refresh_task = asyncio.create_task(self._refresh_loop(), name="po_refresh")
+        self._ping_task    = asyncio.create_task(self._ping_loop(),    name=f"po_ping_{self.chat_id}")
+        self._refresh_task = asyncio.create_task(self._refresh_loop(), name=f"po_refresh_{self.chat_id}")
         return True
 
     def _cancel_tasks(self) -> None:
@@ -327,30 +381,28 @@ class SessionManager:
 
     async def _ping_loop(self) -> None:
         """Send a lightweight ping every PING_INTERVAL_SECONDS."""
-        logger.info(f"Ping loop started (interval={PING_INTERVAL_SECONDS}s)")
+        logger.info(f"[{self.name}] Ping loop started (interval={PING_INTERVAL_SECONDS}s)")
         while True:
             await asyncio.sleep(PING_INTERVAL_SECONDS)
             if not self.is_connected:
-                logger.warning("Ping loop: client disconnected, stopping ping loop")
+                logger.warning(f"[{self.name}] Ping loop: client disconnected, stopping ping loop")
                 return
             try:
-                # pocketoptionapi_async exposes get_balance as a lightweight
-                # round-trip; fall back to a no-op if unavailable.
                 if hasattr(self.client, "get_balance"):
                     await self.client.get_balance()
-                logger.debug("Ping sent")
+                logger.debug(f"[{self.name}] Ping sent")
             except Exception as exc:
                 await self._handle_error(f"Ping failed: {exc}")
-                return  # _handle_error will restart the loop via _connect
+                return
 
     # ── Background task 2: pre-emptive 23-hour refresh ───────────────── #
 
     async def _refresh_loop(self) -> None:
         """Reconnect every PREEMPTIVE_REFRESH_HOURS to beat session expiry."""
         interval = PREEMPTIVE_REFRESH_HOURS * 3600
-        logger.info(f"Refresh loop started (interval={PREEMPTIVE_REFRESH_HOURS}h)")
+        logger.info(f"[{self.name}] Refresh loop started (interval={PREEMPTIVE_REFRESH_HOURS}h)")
         await asyncio.sleep(interval)
-        logger.info("SessionManager: pre-emptive session refresh triggered")
+        logger.info(f"[{self.name}] SessionManager: pre-emptive session refresh triggered")
         async with self._lock:
             await self._connect()
 
@@ -362,53 +414,46 @@ class SessionManager:
         If all retries fail, send a Telegram alert asking for a new SSID.
         """
         if self._reconnecting:
-            return  # already in progress
+            return
         self._reconnecting = True
-        log_error(f"SessionManager error: {error_msg}")
+        log_error(f"[{self.name}] SessionManager error: {error_msg}")
 
-        delays = [5, 30, 120]  # seconds between retries
+        delays = [5, 30, 120]
         for attempt, delay in enumerate(delays, start=1):
-            logger.info(f"Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
+            logger.info(f"[{self.name}] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
             await asyncio.sleep(delay)
             async with self._lock:
                 success = await self._connect()
             if success:
-                logger.info(f"Reconnect succeeded on attempt {attempt}")
+                logger.info(f"[{self.name}] Reconnect succeeded on attempt {attempt}")
                 self._reconnecting = False
-                await _telegram_notify(
-                    "✅ Pocket Option reconnected successfully after a connection error."
-                )
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=self.chat_id,
+                        text="\u2705 Pocket Option reconnected successfully after a connection error.",
+                    )
+                except Exception as exc:
+                    logger.error(f"[{self.name}] Telegram notify error: {exc}")
                 return
 
-        # All retries exhausted
         self._reconnecting = False
-        log_error("All reconnect attempts failed — SSID needs manual refresh")
-        await _telegram_notify(
-            "⚠️ Pocket Option connection lost and could not reconnect.\n\n"
-            "Your SSID has likely expired. To fix without redeploying:\n"
-            "1. Open pocketoption.com and log in\n"
-            "2. Press F12 → Network tab → filter WS\n"
-            '3. Find the message starting with 42["auth",\n'
-            "4. Copy the full string\n"
-            "5. Send: /setssid <paste the string here>\n\n"
-            "The bot will reconnect immediately."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Telegram helpers
-# ---------------------------------------------------------------------------
-telegram_app = Application.builder().token(TOKEN).build()
-
-
-async def _telegram_notify(text: str) -> None:
-    """Send a plain-text message to CHAT_ID (best-effort)."""
-    if not CHAT_ID:
-        return
-    try:
-        await telegram_app.bot.send_message(chat_id=CHAT_ID, text=text)
-    except Exception as exc:
-        logger.error(f"Telegram notify error: {exc}")
+        log_error(f"[{self.name}] All reconnect attempts failed — SSID needs manual refresh")
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=self.chat_id,
+                text=(
+                    "\u26a0\ufe0f Pocket Option connection lost and could not reconnect.\n\n"
+                    "Your SSID has likely expired. To fix without redeploying:\n"
+                    "1. Open pocketoption.com and log in\n"
+                    "2. Press F12 \u2192 Network tab \u2192 filter WS\n"
+                    '3. Find the message starting with 42["auth",\n'
+                    "4. Copy the full string\n"
+                    "5. Send: /setssid <paste the string here>\n\n"
+                    "The bot will reconnect immediately."
+                ),
+            )
+        except Exception as exc:
+            logger.error(f"[{self.name}] Telegram notify error: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +484,6 @@ def _rsi(values: list[float], period: int = 14) -> float | None:
         d = values[i] - values[i - 1]
         gains.append(max(d, 0))
         losses.append(max(-d, 0))
-    # Wilder smoothing
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
     for i in range(period, len(gains)):
@@ -513,17 +557,16 @@ def compute_signal_advanced(
     ema9_val  = ema9[-1]
     ema21_val = ema21[-1]
 
-    # ── Direction logic ──────────────────────────────────────────────────
     bullish_signals = 0
     bearish_signals = 0
 
     # RSI
     if rsi < 35:
-        bullish_signals += 2   # oversold → likely bounce up
+        bullish_signals += 2
     elif rsi < 45:
         bullish_signals += 1
     elif rsi > 65:
-        bearish_signals += 2   # overbought → likely drop
+        bearish_signals += 2
     elif rsi > 55:
         bearish_signals += 1
 
@@ -539,7 +582,7 @@ def compute_signal_advanced(
     else:
         bearish_signals += 1
 
-    # 3-candle momentum (existing logic)
+    # 3-candle momentum
     if len(closes) >= 4:
         c = closes[-4:]
         if c[-1] > c[-2] > c[-3] > c[-4]:
@@ -558,24 +601,21 @@ def compute_signal_advanced(
         direction = "LOWER"
         raw_conf  = bearish_signals / total
     else:
-        result["direction"] = "WAIT"
-        result["reason"]    = "Mixed signals — no clear edge"
+        result["direction"]  = "WAIT"
+        result["reason"]     = "Mixed signals \u2014 no clear edge"
         result["confidence"] = 50
         return result
 
-    # ── Confidence score ─────────────────────────────────────────────────
-    # Base: signal ratio (50–80%)
+    # Confidence score
     base_conf = 50 + raw_conf * 30
 
-    # RSI extremity bonus (up to +15%)
     if direction == "HIGHER" and rsi is not None:
-        rsi_bonus = max(0, (40 - rsi) / 40) * 15   # RSI=0 → +15, RSI=40 → 0
+        rsi_bonus = max(0, (40 - rsi) / 40) * 15
     elif direction == "LOWER" and rsi is not None:
-        rsi_bonus = max(0, (rsi - 60) / 40) * 15   # RSI=100 → +15, RSI=60 → 0
+        rsi_bonus = max(0, (rsi - 60) / 40) * 15
     else:
         rsi_bonus = 0
 
-    # Timeframe penalty: very short timeframes are noisier
     tf_penalty = 0
     if timeframe_seconds <= 5:
         tf_penalty = 8
@@ -584,7 +624,6 @@ def compute_signal_advanced(
 
     confidence = min(97, max(51, int(base_conf + rsi_bonus - tf_penalty)))
 
-    # ── Reason string ────────────────────────────────────────────────────
     ema_desc = "EMA9 > EMA21" if ema9_val > ema21_val else "EMA9 < EMA21"
     reason = (
         f"RSI={rsi:.1f}, {ema_desc}, "
@@ -599,58 +638,43 @@ def compute_signal_advanced(
     return result
 
 
-# Legacy wrapper used by the auto-broadcast loop
 def compute_signal(candles: list) -> tuple[str, str]:
+    """Legacy wrapper used by the auto-broadcast loop."""
     r = compute_signal_advanced(candles)
     if r["direction"] == "HIGHER":
-        return "CALL ✅", r["reason"]
+        return "CALL \u2705", r["reason"]
     if r["direction"] == "LOWER":
-        return "PUT ❌", r["reason"]
-    return "WAIT ⏸", r["reason"]
+        return "PUT \u274c", r["reason"]
+    return "WAIT \u23f8", r["reason"]
 
 
 # ---------------------------------------------------------------------------
-# Global SessionManager instance (created in lifespan)
+# Per-user polling loop
 # ---------------------------------------------------------------------------
-session_manager: "SessionManager | None" = None
 
+async def _user_poll_loop(us: UserSession) -> None:
+    """Independent polling loop for one user's Pocket Option connection."""
+    logger.info(f"[{us.name}] Polling loop started.")
 
-# ---------------------------------------------------------------------------
-# Background polling loop
-# ---------------------------------------------------------------------------
-async def pocket_option_loop() -> None:
-    """
-    Polls Pocket Option for candles every CANDLE_PERIOD seconds.
-    Delegates all connection/reconnection logic to SessionManager.
-    """
-    global latest_signal
-
-    logger.info("Pocket Option polling loop started.")
-
-    # Wait for initial connection (with timeout)
+    # Wait for initial connection
     for _ in range(30):
-        if session_manager and session_manager.is_connected:
+        if us.session_manager and us.session_manager.is_connected:
             break
         await asyncio.sleep(2)
     else:
-        log_error("Polling loop: timed out waiting for initial connection")
+        log_error(f"[{us.name}] Timed out waiting for initial connection")
 
     while True:
         try:
-            if not (session_manager and session_manager.is_connected):
-                logger.warning("Polling loop: not connected, waiting...")
+            if not (us.session_manager and us.session_manager.is_connected):
                 await asyncio.sleep(10)
                 continue
 
-            candles = await session_manager.get_candles(
-                asset=TRADE_ASSET,
-                timeframe=CANDLE_PERIOD,
-                count=CANDLE_COUNT,
+            candles = await us.session_manager.get_candles(
+                asset=TRADE_ASSET, timeframe=CANDLE_PERIOD, count=CANDLE_COUNT
             )
-            logger.info(f"Received {len(candles) if candles else 0} candles")
 
             direction, reason = compute_signal(candles)
-
             price = None
             if candles:
                 try:
@@ -658,77 +682,211 @@ async def pocket_option_loop() -> None:
                 except (AttributeError, TypeError, ValueError):
                     pass
 
-            latest_signal = {
+            us.latest_signal = {
                 "direction": direction,
                 "price":     price,
                 "reason":    reason,
                 "timestamp": str(datetime.now()),
             }
-            logger.info(f"Signal: {direction} | {reason} | price={price}")
 
-            # Broadcast actionable signals to all opted-in users
-            if direction != "WAIT ⏸":
-                result = compute_signal_advanced(candles)
+            if direction != "WAIT \u23f8" and us.settings.get("auto", False):
+                result    = compute_signal_advanced(candles)
                 price_str = f"{price:.5f}" if price else "N/A"
-
-                # Build recipients: known_users who have auto ON
-                recipients: set[int] = {
-                    uid for uid in known_users
-                    if _get_settings(uid).get("auto", True)
-                }
-
-                # Bootstrap fallback: if nobody has /start-ed yet, still notify CHAT_ID
-                # but only if CHAT_ID itself has auto ON (or hasn't opted out yet)
-                if CHAT_ID:
-                    try:
-                        chat_id_int = int(CHAT_ID)
-                        # Always register CHAT_ID as a known user so auto-setting applies
-                        known_users.add(chat_id_int)
-                        if _get_settings(chat_id_int).get("auto", True):
-                            recipients.add(chat_id_int)
-                    except ValueError:
-                        pass
-
-                for chat_id in recipients:
-                    await _send_signal_message(
-                        chat_id=chat_id,
-                        result=result,
-                        asset_label="EUR/USD (OTC)",
-                        tf_label="1 minute",
-                        price_str=price_str,
-                    )
+                await _send_signal_message(
+                    chat_id=us.chat_id,
+                    result=result,
+                    asset_label="EUR/USD (OTC)",
+                    tf_label="1 minute",
+                    price_str=price_str,
+                )
 
         except Exception as exc:
             err = str(exc)
-            log_error(f"Polling loop error: {err}")
-            if session_manager:
-                await session_manager.notify_error(err)
+            log_error(f"[{us.name}] Poll error: {err}")
+            if us.session_manager:
+                await us.session_manager.notify_error(err)
 
         await asyncio.sleep(CANDLE_PERIOD)
 
 
 # ---------------------------------------------------------------------------
-# Per-user helpers
+# Signal fetching & formatting
 # ---------------------------------------------------------------------------
 
-def _get_settings(user_id: int) -> dict:
-    if user_id not in user_settings:
-        user_settings[user_id] = dict(DEFAULT_SETTINGS)
-    return user_settings[user_id]
+async def _fetch_signal(asset_code: str, tf_seconds: int,
+                        us: "UserSession | None" = None) -> dict:
+    sm = us.session_manager if us else None
+    if not (sm and sm.is_connected):
+        return {
+            "direction": "WAIT", "confidence": 0,
+            "rsi": None, "reason": "Not connected to Pocket Option",
+            "market": "Unknown",
+        }
+    try:
+        candles = await sm.get_candles(
+            asset=asset_code, timeframe=tf_seconds, count=CANDLE_COUNT
+        )
+        return compute_signal_advanced(candles, tf_seconds)
+    except Exception as exc:
+        log_error(f"_fetch_signal error: {exc}")
+        return {
+            "direction": "WAIT", "confidence": 0,
+            "rsi": None, "reason": f"Error: {exc}",
+            "market": "Unknown",
+        }
+
+
+def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
+    """
+    Returns a plain-text signal message with large BUY/SELL header.
+    Used for inline menu display (edit_message_text).
+    """
+    direction  = result["direction"]
+    confidence = result["confidence"]
+    rsi        = result["rsi"]
+    reason     = result["reason"]
+    market     = result["market"]
+
+    if direction == "HIGHER":
+        header = "\U0001f4c8 BUY (CALL)"
+    elif direction == "LOWER":
+        header = "\U0001f4c9 SELL (PUT)"
+    else:
+        header = "\u23f8 WAIT \u2014 no clear signal"
+
+    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+    filled  = round(confidence / 20)
+    bar     = "\u2588" * filled + "\u2591" * (5 - filled)
+
+    return (
+        f"{header}\n\n"
+        f"Asset: {asset_label}\n"
+        f"Timeframe: {tf_label}\n"
+        f"Reliability: {confidence}%  {bar}\n"
+        f"RSI: {rsi_str}\n"
+        f"Market: {market}\n"
+        f"Reason: {reason}\n"
+        f"Time: {datetime.now().strftime('%H:%M:%S')}"
+    )
+
+
+def _signal_caption(result: dict, asset_label: str, tf_label: str,
+                    price_str: str = "") -> str:
+    """
+    Caption for send_photo — same info as _format_signal but without
+    the large header (the image carries the visual direction cue).
+    """
+    direction  = result["direction"]
+    confidence = result["confidence"]
+    rsi        = result["rsi"]
+    reason     = result["reason"]
+    market     = result["market"]
+
+    action  = "BUY" if direction == "HIGHER" else "SELL"
+    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+    filled  = round(confidence / 20)
+    bar     = "\u2588" * filled + "\u2591" * (5 - filled)
+
+    lines = [
+        f"{action} Signal",
+        f"Asset: {asset_label}",
+        f"Timeframe: {tf_label}",
+    ]
+    if price_str:
+        lines.append(f"Price: {price_str}")
+    lines += [
+        f"Reliability: {confidence}%  {bar}",
+        f"RSI: {rsi_str}",
+        f"Market: {market}",
+        f"Reason: {reason}",
+        f"Time: {datetime.now().strftime('%H:%M:%S')}",
+    ]
+    return "\n".join(lines)
+
+
+async def _send_signal_message(
+    chat_id: int,
+    result: dict,
+    asset_label: str,
+    tf_label: str,
+    price_str: str = "",
+) -> None:
+    """
+    Send a signal to a single chat_id with Win/Loss vote buttons.
+    - HIGHER → send SIGNAL_IMG_BUY photo (fallback to text)
+    - LOWER  → send SIGNAL_IMG_SELL photo (fallback to text)
+    - WAIT   → skip (no broadcast)
+    """
+    direction = result["direction"]
+    if direction == "WAIT":
+        return
+
+    signal_id = _make_signal_id(chat_id)
+    pending_signals[signal_id] = {
+        "user_id": chat_id,
+        "ts":      time.time(),
+        "voted":   False,
+    }
+
+    img_url  = SIGNAL_IMG_BUY if direction == "HIGHER" else SIGNAL_IMG_SELL
+    caption  = _signal_caption(result, asset_label, tf_label, price_str)
+    keyboard = _vote_keyboard(signal_id)
+
+    if img_url:
+        try:
+            await telegram_app.bot.send_photo(
+                chat_id=chat_id,
+                photo=img_url,
+                caption=caption,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception as exc:
+            logger.warning(f"send_photo failed for {chat_id}: {exc} — falling back to text")
+
+    text = _format_signal(result, asset_label, tf_label)
+    if price_str:
+        text += f"\nPrice: {price_str}"
+    try:
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+        )
+    except Exception as exc:
+        logger.error(f"send_message fallback also failed for {chat_id}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Auth guard decorator
+# ---------------------------------------------------------------------------
+
+def _require_auth(func):
+    """Decorator that rejects commands from unregistered chat IDs."""
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        if chat_id not in user_registry:
+            await update.effective_message.reply_text(
+                "\u26d4 You are not authorized to use this bot."
+            )
+            return
+        return await func(update, context)
+    wrapper.__name__ = func.__name__
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
 # Keyboard builders
 # ---------------------------------------------------------------------------
 
-def _main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    settings = _get_settings(user_id)
-    auto_label = "\U0001f514 Auto-signals: ON" if settings["auto"] else "\U0001f515 Auto-signals: OFF"
+def _main_menu_keyboard(user_id: int, us: "UserSession | None" = None) -> InlineKeyboardMarkup:
+    auto = us.settings.get("auto", False) if us else False
+    auto_label = "\U0001f514 Auto-signals: ON" if auto else "\U0001f515 Auto-signals: OFF"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001f4ca Get Signal",   callback_data="menu:signal")],
+        [InlineKeyboardButton("\U0001f4ca Get Signal",     callback_data="menu:signal")],
         [InlineKeyboardButton("\u2139\ufe0f How it works", callback_data="menu:howto")],
-        [InlineKeyboardButton("\u2699\ufe0f Settings",   callback_data="menu:settings")],
-        [InlineKeyboardButton(auto_label,               callback_data="menu:toggle_auto")],
+        [InlineKeyboardButton("\u2699\ufe0f Settings",     callback_data="menu:settings")],
+        [InlineKeyboardButton(auto_label,                  callback_data="menu:toggle_auto")],
     ])
 
 
@@ -751,8 +909,8 @@ def _timeframe_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    s = _get_settings(user_id)
+def _settings_keyboard(user_id: int, us: "UserSession | None" = None) -> InlineKeyboardMarkup:
+    s = us.settings if us else DEFAULT_SETTINGS
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Asset: {s['asset']}",         callback_data="settings:asset")],
         [InlineKeyboardButton(f"Timeframe: {s['timeframe']}", callback_data="settings:tf")],
@@ -763,47 +921,60 @@ def _settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 # /start  — main menu
 # ---------------------------------------------------------------------------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user  = update.effective_user
-    uid   = user.id
-    name  = user.first_name or "Trader"
-    po_ok = session_manager is not None and session_manager.is_connected
+    chat_id = update.effective_chat.id
+    us = _get_user_session(chat_id)
+    if not us:
+        await update.effective_message.reply_text(
+            "\u26d4 You are not authorized to use this bot."
+        )
+        return
+
+    name  = update.effective_user.first_name or us.name
+    po_ok = us.session_manager is not None and us.session_manager.is_connected
     conn_str = "\U0001f7e2 Live" if po_ok else "\U0001f534 Offline"
 
-    # Register user for auto-broadcasts
-    known_users.add(uid)
-
-    text  = (
+    text = (
         f"\U0001f44b Welcome, {name}!\n\n"
         "\U0001f4e1 OTC Signal Bot\n"
         f"Connection: {conn_str}\n\n"
         "Tap a button below, or use these commands:\n"
-        "/signal \u2014 latest auto-signal\n"
+        "/signal \u2014 latest signal\n"
         "/stats \u2014 your win/loss statistics\n"
         "/autoon \u2014 enable auto-signals\n"
         "/autooff \u2014 disable auto-signals\n"
         "/status \u2014 connection status\n"
         "/getssid \u2014 show current SSID info\n"
-        "/setssid <string> \u2014 update SSID without redeploying\n"
+        "/setssid <string> \u2014 update SSID\n"
         "/reconnect \u2014 force reconnect\n"
         "/logs \u2014 recent errors\n"
         "/debug \u2014 full diagnostics"
     )
+    uid = update.effective_user.id
     if update.message:
-        await update.message.reply_text(text, reply_markup=_main_menu_keyboard(uid))
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard(uid, us))
     else:
-        await update.callback_query.edit_message_text(text, reply_markup=_main_menu_keyboard(uid))
+        await update.callback_query.edit_message_text(text, reply_markup=_main_menu_keyboard(uid, us))
 
 
 # ---------------------------------------------------------------------------
 # Inline button router  (ConversationHandler states: CHOOSE_ASSET, CHOOSE_TIME)
 # ---------------------------------------------------------------------------
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query    = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    data     = query.data
-    user_id  = query.from_user.id
-    settings = _get_settings(user_id)
+    data    = query.data
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id
+
+    us = _get_user_session(chat_id)
+    if not us:
+        await query.edit_message_text("\u26d4 You are not authorized to use this bot.")
+        return ConversationHandler.END
+
+    settings = us.settings
 
     # ── Main menu ────────────────────────────────────────────────────────
     if data == "menu:back":
@@ -838,7 +1009,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if data == "menu:settings":
         await query.edit_message_text(
             "\u2699\ufe0f Settings\n\nYour current defaults:",
-            reply_markup=_settings_keyboard(user_id),
+            reply_markup=_settings_keyboard(user_id, us),
         )
         return ConversationHandler.END
 
@@ -922,29 +1093,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\u23f3 Fetching signal for {asset_label} / {tf_label}..."
         )
 
-        result = await _fetch_signal(asset_code, tf_seconds)
+        result = await _fetch_signal(asset_code, tf_seconds, us)
 
-        # For WAIT signals just show text in the existing message
         if result["direction"] == "WAIT":
             await query.edit_message_text(
                 _format_signal(result, asset_label, tf_label),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("\U0001f504 Retry", callback_data=f"tf:{tf_label}")],
+                    [InlineKeyboardButton("\U0001f504 Retry",        callback_data=f"tf:{tf_label}")],
                     [InlineKeyboardButton("\U0001f4ca Change Asset", callback_data="menu:signal")],
-                    [InlineKeyboardButton("\U0001f3e0 Main Menu",   callback_data="menu:back")],
+                    [InlineKeyboardButton("\U0001f3e0 Main Menu",    callback_data="menu:back")],
                 ]),
             )
         else:
-            # Edit the "fetching..." message to show a nav keyboard
             await query.edit_message_text(
                 _format_signal(result, asset_label, tf_label),
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("\U0001f504 New Signal", callback_data=f"tf:{tf_label}")],
+                    [InlineKeyboardButton("\U0001f504 New Signal",   callback_data=f"tf:{tf_label}")],
                     [InlineKeyboardButton("\U0001f4ca Change Asset", callback_data="menu:signal")],
-                    [InlineKeyboardButton("\U0001f3e0 Main Menu",   callback_data="menu:back")],
+                    [InlineKeyboardButton("\U0001f3e0 Main Menu",    callback_data="menu:back")],
                 ]),
             )
-            # Also send the photo signal as a separate message
             await _send_signal_message(
                 chat_id=query.message.chat_id,
                 result=result,
@@ -959,167 +1127,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ---------------------------------------------------------------------------
-# Signal fetching & formatting
+# Command handlers
 # ---------------------------------------------------------------------------
 
-async def _fetch_signal(asset_code: str, tf_seconds: int) -> dict:
-    if not (session_manager and session_manager.is_connected):
-        return {
-            "direction": "WAIT", "confidence": 0,
-            "rsi": None, "reason": "Not connected to Pocket Option",
-            "market": "Unknown",
-        }
-    try:
-        candles = await session_manager.get_candles(
-            asset=asset_code,
-            timeframe=tf_seconds,
-            count=CANDLE_COUNT,
-        )
-        return compute_signal_advanced(candles, tf_seconds)
-    except Exception as exc:
-        log_error(f"_fetch_signal error: {exc}")
-        return {
-            "direction": "WAIT", "confidence": 0,
-            "rsi": None, "reason": f"Error: {exc}",
-            "market": "Unknown",
-        }
-
-
-def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
-    """
-    Returns a plain-text signal message with large BUY/SELL header.
-    Used for inline menu display (edit_message_text).
-    """
-    direction  = result["direction"]
-    confidence = result["confidence"]
-    rsi        = result["rsi"]
-    reason     = result["reason"]
-    market     = result["market"]
-
-    if direction == "HIGHER":
-        header = "\U0001f4c8 BUY (CALL)"
-    elif direction == "LOWER":
-        header = "\U0001f4c9 SELL (PUT)"
-    else:
-        header = "\u23f8 WAIT — no clear signal"
-
-    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
-    filled  = round(confidence / 20)
-    bar     = "\u2588" * filled + "\u2591" * (5 - filled)
-
-    return (
-        f"{header}\n\n"
-        f"Asset: {asset_label}\n"
-        f"Timeframe: {tf_label}\n"
-        f"Reliability: {confidence}%  {bar}\n"
-        f"RSI: {rsi_str}\n"
-        f"Market: {market}\n"
-        f"Reason: {reason}\n"
-        f"Time: {datetime.now().strftime('%H:%M:%S')}"
-    )
-
-
-def _signal_caption(result: dict, asset_label: str, tf_label: str,
-                    price_str: str = "") -> str:
-    """
-    Caption for send_photo — same info as _format_signal but without
-    the large header (the image carries the visual direction cue).
-    """
-    direction  = result["direction"]
-    confidence = result["confidence"]
-    rsi        = result["rsi"]
-    reason     = result["reason"]
-    market     = result["market"]
-
-    action = "BUY" if direction == "HIGHER" else "SELL"
-    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
-    filled  = round(confidence / 20)
-    bar     = "\u2588" * filled + "\u2591" * (5 - filled)
-
-    lines = [
-        f"{action} Signal",
-        f"Asset: {asset_label}",
-        f"Timeframe: {tf_label}",
-    ]
-    if price_str:
-        lines.append(f"Price: {price_str}")
-    lines += [
-        f"Reliability: {confidence}%  {bar}",
-        f"RSI: {rsi_str}",
-        f"Market: {market}",
-        f"Reason: {reason}",
-        f"Time: {datetime.now().strftime('%H:%M:%S')}",
-    ]
-    return "\n".join(lines)
-
-
-async def _send_signal_message(
-    chat_id: int,
-    result: dict,
-    asset_label: str,
-    tf_label: str,
-    price_str: str = "",
-) -> None:
-    """
-    Send a signal to a single chat_id with Win/Loss vote buttons.
-    - HIGHER → send SIGNAL_IMG_BUY photo (fallback to text)
-    - LOWER  → send SIGNAL_IMG_SELL photo (fallback to text)
-    - WAIT   → skip (no broadcast)
-    """
-    direction = result["direction"]
-    if direction == "WAIT":
-        return
-
-    # Create a unique signal ID and register it as pending
-    signal_id = _make_signal_id(chat_id)
-    pending_signals[signal_id] = {
-        "user_id": chat_id,
-        "ts":      time.time(),
-        "voted":   False,
-    }
-
-    img_url  = SIGNAL_IMG_BUY if direction == "HIGHER" else SIGNAL_IMG_SELL
-    caption  = _signal_caption(result, asset_label, tf_label, price_str)
-    keyboard = _vote_keyboard(signal_id)
-
-    if img_url:
-        try:
-            await telegram_app.bot.send_photo(
-                chat_id=chat_id,
-                photo=img_url,
-                caption=caption,
-                reply_markup=keyboard,
-            )
-            return
-        except Exception as exc:
-            logger.warning(f"send_photo failed for {chat_id}: {exc} — falling back to text")
-
-    # Fallback: plain text with the large header
-    text = _format_signal(result, asset_label, tf_label)
-    if price_str:
-        text += f"\nPrice: {price_str}"
-    try:
-        await telegram_app.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-        )
-    except Exception as exc:
-        logger.error(f"send_message fallback also failed for {chat_id}: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# Remaining command handlers
-# ---------------------------------------------------------------------------
-
+@_require_auth
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually request the latest signal for the user's default asset/timeframe."""
-    uid      = update.effective_user.id
-    known_users.add(uid)
-    settings = _get_settings(uid)
-
-    asset_label = settings["asset"]
-    tf_label    = settings["timeframe"]
+    us = _get_user_session(update.effective_chat.id)
+    asset_label = us.settings["asset"]
+    tf_label    = us.settings["timeframe"]
     asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
     tf_seconds  = TIMEFRAMES.get(tf_label, 60)
 
@@ -1127,7 +1143,7 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"\u23f3 Fetching signal for {asset_label} / {tf_label}..."
     )
 
-    result = await _fetch_signal(asset_code, tf_seconds)
+    result = await _fetch_signal(asset_code, tf_seconds, us)
 
     if result["direction"] == "WAIT":
         await update.message.reply_text(_format_signal(result, asset_label, tf_label))
@@ -1140,11 +1156,11 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+@_require_auth
 async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Enable auto-signals for this user."""
-    uid = update.effective_user.id
-    known_users.add(uid)
-    _get_settings(uid)["auto"] = True
+    us = _get_user_session(update.effective_chat.id)
+    us.settings["auto"] = True
     await update.message.reply_text(
         "\U0001f514 Auto-signals enabled.\n"
         f"You will receive signals every {CANDLE_PERIOD // 60} minute(s).\n\n"
@@ -1152,11 +1168,11 @@ async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+@_require_auth
 async def autooff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Disable auto-signals for this user."""
-    uid = update.effective_user.id
-    known_users.add(uid)
-    _get_settings(uid)["auto"] = False
+    us = _get_user_session(update.effective_chat.id)
+    us.settings["auto"] = False
     await update.message.reply_text(
         "\U0001f515 Auto-signals disabled.\n"
         "You will no longer receive scheduled signals.\n\n"
@@ -1165,15 +1181,19 @@ async def autooff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+@_require_auth
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    po_ok = session_manager is not None and session_manager.is_connected
+    us = _get_user_session(update.effective_chat.id)
+    sm = us.session_manager
+    po_ok = sm is not None and sm.is_connected
     connected_since = (
-        session_manager.connected_at.strftime("%H:%M:%S")
-        if session_manager and session_manager.connected_at else "never"
+        sm.connected_at.strftime("%H:%M:%S")
+        if sm and sm.connected_at else "never"
     )
-    sig = latest_signal
+    sig = us.latest_signal
     await update.message.reply_text(
         f"Bot Status\n"
+        f"User: {us.name}\n"
         f"Server time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"PO connected: {'yes' if po_ok else 'no'}\n"
         f"Connected since: {connected_since}\n"
@@ -1181,30 +1201,36 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+@_require_auth
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    po_ok = session_manager is not None and session_manager.is_connected
-    ssid_preview = f"{SSID[:25]}...{SSID[-8:]}" if len(SSID) > 33 else SSID
+    us = _get_user_session(update.effective_chat.id)
+    sm = us.session_manager
+    po_ok = sm is not None and sm.is_connected
+    ssid = us.ssid
+    ssid_preview = f"{ssid[:25]}...{ssid[-8:]}" if len(ssid) > 33 else ssid
     refresh_in = "unknown"
-    if session_manager and session_manager.connected_at:
-        next_refresh = session_manager.connected_at + timedelta(hours=PREEMPTIVE_REFRESH_HOURS)
+    if sm and sm.connected_at:
+        next_refresh = sm.connected_at + timedelta(hours=PREEMPTIVE_REFRESH_HOURS)
         delta = next_refresh - datetime.now()
         h, rem = divmod(int(max(delta.total_seconds(), 0)), 3600)
         m = rem // 60
         refresh_in = f"{h}h {m}m" if delta.total_seconds() > 0 else "imminent"
     await update.message.reply_text(
         f"Debug Info\n"
+        f"User: {us.name} (chat_id={us.chat_id})\n"
         f"IS_RENDER: {IS_RENDER}\n"
         f"RENDER_URL: {RENDER_EXTERNAL_URL or 'not set'}\n"
-        f"SSID set: {'yes' if SSID else 'no'}\n"
+        f"SSID set: {'yes' if ssid else 'no'}\n"
         f"SSID preview: {ssid_preview}\n"
         f"PO connected: {'yes' if po_ok else 'no'}\n"
         f"Next pre-emptive refresh: {refresh_in}\n"
         f"Ping interval: {PING_INTERVAL_SECONDS}s\n"
-        f"Last auto-signal: {latest_signal['direction'] or 'none'}\n"
-        f"Last update: {latest_signal['timestamp'] or 'never'}"
+        f"Last auto-signal: {us.latest_signal['direction'] or 'none'}\n"
+        f"Last update: {us.latest_signal['timestamp'] or 'never'}"
     )
 
 
+@_require_auth
 async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not recent_errors:
         await update.message.reply_text("No recent errors.")
@@ -1212,11 +1238,14 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("Recent Errors:\n\n" + "\n".join(recent_errors[-10:]))
 
 
+@_require_auth
 async def reconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    us = _get_user_session(update.effective_chat.id)
+    sm = us.session_manager
     await update.message.reply_text("Forcing reconnect to Pocket Option...")
-    if session_manager:
-        async with session_manager._lock:
-            success = await session_manager._connect()
+    if sm:
+        async with sm._lock:
+            success = await sm._connect()
         if success:
             await update.message.reply_text("Reconnected successfully.")
         else:
@@ -1231,8 +1260,7 @@ async def reconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 def _parse_uid_from_ssid(ssid: str) -> str | None:
     """Extract the uid value from a 42["auth",{...}] string."""
     try:
-        # Strip the leading "42" and parse the JSON array
-        payload = json.loads(ssid[2:])   # ["auth", {...}]
+        payload = json.loads(ssid[2:])
         if isinstance(payload, list) and len(payload) >= 2:
             return str(payload[1].get("uid", ""))
     except Exception:
@@ -1240,17 +1268,15 @@ def _parse_uid_from_ssid(ssid: str) -> str | None:
     return None
 
 
+@_require_auth
 async def setssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Update the SSID at runtime without redeploying.
 
     Usage:
         /setssid 42["auth",{"session":"...","isDemo":1,"uid":123,"platform":1}]
-
-    The new SSID is applied immediately. It is NOT persisted to disk — also
-    update the SSID env var on Render so it survives a service restart.
     """
-    global SSID
+    us = _get_user_session(update.effective_chat.id)
 
     HELP = (
         "Usage: /setssid <full auth string>\n\n"
@@ -1273,32 +1299,30 @@ async def setssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     new_ssid = " ".join(context.args).strip()
 
-    # ── Validation ───────────────────────────────────────────────────────
     if not (new_ssid.startswith('42["auth"') or new_ssid.startswith("42['auth'")):
         await update.message.reply_text(
-            '❌ Invalid format — must start with: 42["auth",\n\n' + HELP
+            '\u274c Invalid format \u2014 must start with: 42["auth",\n\n' + HELP
         )
         return
 
     if '"session"' not in new_ssid and "'session'" not in new_ssid:
         await update.message.reply_text(
-            '❌ Invalid SSID — missing "session" field.\n\n' + HELP
+            '\u274c Invalid SSID \u2014 missing "session" field.\n\n' + HELP
         )
         return
 
     if '"uid"' not in new_ssid and "'uid'" not in new_ssid:
         await update.message.reply_text(
-            '❌ Invalid SSID — missing "uid" field.\n\n' + HELP
+            '\u274c Invalid SSID \u2014 missing "uid" field.\n\n' + HELP
         )
         return
 
     uid_str = _parse_uid_from_ssid(new_ssid)
     preview = f"{new_ssid[:30]}...{new_ssid[-10:]}" if len(new_ssid) > 40 else new_ssid
 
-    # ── Apply ────────────────────────────────────────────────────────────
-    SSID = new_ssid
-    if session_manager:
-        session_manager.ssid = new_ssid
+    us.ssid = new_ssid
+    if us.session_manager:
+        us.session_manager.ssid = new_ssid
 
     await update.message.reply_text(
         f"SSID received. Reconnecting...\n"
@@ -1306,30 +1330,33 @@ async def setssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"UID: {uid_str or 'could not parse'}"
     )
 
-    if session_manager:
-        async with session_manager._lock:
-            success = await session_manager._connect()
+    if us.session_manager:
+        async with us.session_manager._lock:
+            success = await us.session_manager._connect()
         if success:
             await update.message.reply_text(
-                f"✅ Connected successfully!\n"
+                f"\u2705 Connected successfully!\n"
                 f"SSID starts with: {new_ssid[:30]}...\n"
                 f"UID: {uid_str or 'N/A'}\n\n"
                 "Also update the SSID env var on Render so it survives a restart."
             )
         else:
             await update.message.reply_text(
-                "❌ Reconnect failed — the SSID may be invalid or already expired.\n"
+                "\u274c Reconnect failed \u2014 the SSID may be invalid or already expired.\n"
                 "Check /logs for the exact error, then try a fresh SSID."
             )
     else:
         await update.message.reply_text("Session manager not initialised yet.")
 
 
+@_require_auth
 async def getssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show the current SSID preview and uid for debugging."""
-    current_ssid = session_manager.ssid if session_manager else SSID
+    us = _get_user_session(update.effective_chat.id)
+    sm = us.session_manager
+    current_ssid = sm.ssid if sm else us.ssid
     uid_str      = _parse_uid_from_ssid(current_ssid) if current_ssid else None
-    po_ok        = session_manager is not None and session_manager.is_connected
+    po_ok        = sm is not None and sm.is_connected
 
     if not current_ssid:
         await update.message.reply_text("No SSID is currently set.")
@@ -1341,12 +1368,13 @@ async def getssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
     connected_since = (
-        session_manager.connected_at.strftime("%Y-%m-%d %H:%M:%S")
-        if session_manager and session_manager.connected_at else "never"
+        sm.connected_at.strftime("%Y-%m-%d %H:%M:%S")
+        if sm and sm.connected_at else "never"
     )
 
     await update.message.reply_text(
         f"Current SSID Info\n\n"
+        f"User: {us.name}\n"
         f"Preview: {preview}\n"
         f"UID: {uid_str or 'could not parse'}\n"
         f"Connected: {'yes' if po_ok else 'no'}\n"
@@ -1363,13 +1391,13 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     total   = s["total"]
     wins    = s["wins"]
     losses  = s["losses"]
-    last_5  = " ".join(s["last_5"]) if s["last_5"] else "—"
+    last_5  = " ".join(s["last_5"]) if s["last_5"] else "\u2014"
 
-    win_pct  = f"{wins / total * 100:.1f}%" if total else "—"
-    loss_pct = f"{losses / total * 100:.1f}%" if total else "—"
+    win_pct  = f"{wins / total * 100:.1f}%" if total else "\u2014"
+    loss_pct = f"{losses / total * 100:.1f}%" if total else "\u2014"
 
     await update.message.reply_text(
-        f"📊 Your Trading Stats\n\n"
+        f"\U0001f4ca Your Trading Stats\n\n"
         f"Total signals: {total}\n"
         f"Wins:   {wins} ({win_pct})\n"
         f"Losses: {losses} ({loss_pct})\n"
@@ -1378,7 +1406,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def vote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle 👍 Win / 👎 Loss button presses on signal messages."""
+    """Handle Win / Loss button presses on signal messages."""
     query = update.callback_query
     data  = query.data  # format: "vote:win:<signal_id>" or "vote:loss:<signal_id>"
 
@@ -1387,17 +1415,15 @@ async def vote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await query.answer("Invalid vote data.")
         return
 
-    _, outcome, signal_id = parts   # outcome = "win" or "loss"
+    _, outcome, signal_id = parts
     user_id = query.from_user.id
 
-    # ── Look up the pending signal ────────────────────────────────────────
     signal = pending_signals.get(signal_id)
 
     if signal is None:
         await query.answer("This signal is too old to vote on.")
         return
 
-    # ── Expiry check ──────────────────────────────────────────────────────
     if time.time() - signal["ts"] > SIGNAL_EXPIRY_SEC:
         await query.answer("This signal has expired (10 min limit).")
         pending_signals.pop(signal_id, None)
@@ -1407,24 +1433,21 @@ async def vote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             pass
         return
 
-    # ── Already voted ─────────────────────────────────────────────────────
     if signal["voted"]:
         await query.answer("Already recorded for this signal.")
         return
 
-    # ── Record the vote ───────────────────────────────────────────────────
     won = outcome == "win"
     signal["voted"] = True
     _record_vote(user_id, won)
 
-    label = "Win 👍" if won else "Loss 👎"
+    label = "Win \U0001f44d" if won else "Loss \U0001f44e"
     await query.answer(f"Recorded as {label}!")
 
-    # Replace buttons with a confirmation line
     try:
         await query.edit_message_reply_markup(
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"✅ Recorded: {label}", callback_data="vote:noop")
+                InlineKeyboardButton(f"\u2705 Recorded: {label}", callback_data="vote:noop")
             ]])
         )
     except Exception as exc:
@@ -1439,6 +1462,7 @@ async def vote_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ---------------------------------------------------------------------------
 # Register handlers
 # ---------------------------------------------------------------------------
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
@@ -1453,7 +1477,6 @@ conv_handler = ConversationHandler(
 )
 
 telegram_app.add_handler(conv_handler)
-# Vote handlers run outside ConversationHandler so they always fire
 telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler, pattern="^vote:noop$"))
 telegram_app.add_handler(CallbackQueryHandler(vote_handler,      pattern="^vote:(win|loss):"))
 telegram_app.add_handler(CommandHandler("signal",    signal_command))
@@ -1471,9 +1494,10 @@ telegram_app.add_handler(CommandHandler("getssid",   getssid_command))
 # ---------------------------------------------------------------------------
 # Telegram webhook registration
 # ---------------------------------------------------------------------------
+
 async def reset_and_set_webhook() -> None:
     if not RENDER_EXTERNAL_URL:
-        logger.error("RENDER_EXTERNAL_URL not set — cannot register webhook.")
+        logger.error("RENDER_EXTERNAL_URL not set \u2014 cannot register webhook.")
         return
     webhook_url = f"{RENDER_EXTERNAL_URL}/telegram"
     base = f"https://api.telegram.org/bot{TOKEN}"
@@ -1487,12 +1511,20 @@ async def reset_and_set_webhook() -> None:
 # ---------------------------------------------------------------------------
 # Starlette routes
 # ---------------------------------------------------------------------------
+
 async def health(request: Request) -> JSONResponse:
+    users_status = {
+        str(cid): {
+            "name":      us.name,
+            "connected": us.session_manager is not None and us.session_manager.is_connected,
+            "last_signal": us.latest_signal,
+        }
+        for cid, us in user_registry.items()
+    }
     return JSONResponse({
-        "status":        "healthy",
-        "timestamp":     str(datetime.now()),
-        "po_connected":  session_manager is not None and session_manager.is_connected,
-        "latest_signal": latest_signal,
+        "status":    "healthy",
+        "timestamp": str(datetime.now()),
+        "users":     users_status,
     })
 
 
@@ -1514,46 +1546,55 @@ routes = [
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def lifespan(app: Starlette):
-    global session_manager
-
     logger.info("Starting up...")
     await telegram_app.initialize()
     await telegram_app.start()
     await reset_and_set_webhook()
-
-    # Load persisted win/loss stats
     _load_stats()
 
-    # Pre-register CHAT_ID as a known user so /autooff works from the first signal
-    if CHAT_ID:
-        try:
-            known_users.add(int(CHAT_ID))
-            logger.info(f"Pre-registered CHAT_ID {CHAT_ID} in known_users")
-        except ValueError:
-            pass
+    # Build user registry and start per-user sessions
+    configs = _load_user_configs()
+    for cfg in configs:
+        us = UserSession(
+            name=cfg["name"],
+            chat_id=cfg["chat_id"],
+            ssid=cfg["ssid"],
+            is_demo=cfg["is_demo"],
+        )
+        us.session_manager = SessionManager(
+            ssid=cfg["ssid"],
+            is_demo=cfg["is_demo"],
+            chat_id=cfg["chat_id"],
+            name=cfg["name"],
+        )
+        connected = await us.session_manager.start()
+        if connected:
+            logger.info(f"[{us.name}] Connected to Pocket Option")
+        else:
+            log_error(f"[{us.name}] Initial connection failed \u2014 will retry in poll loop")
 
-    # Create and start the session manager
-    session_manager = SessionManager(ssid=SSID, is_demo=bool(PO_DEMO))
-    connected = await session_manager.start()
-    if connected:
-        logger.info("Initial PO connection established.")
-    else:
-        log_error("Initial PO connection failed — will retry in polling loop")
-
-    # Start the candle-polling loop
-    poll_task = asyncio.create_task(pocket_option_loop(), name="po_poll")
+        us.poll_task = asyncio.create_task(
+            _user_poll_loop(us), name=f"poll_{us.chat_id}"
+        )
+        user_registry[us.chat_id] = us
+        logger.info(f"Registered user: {us.name} (chat_id={us.chat_id})")
 
     yield  # ── server is running ──────────────────────────────────────────
 
-    poll_task.cancel()
-    try:
-        await poll_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    # Shutdown all user sessions
+    for us in user_registry.values():
+        if us.poll_task and not us.poll_task.done():
+            us.poll_task.cancel()
+            try:
+                await us.poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if us.session_manager:
+            await us.session_manager.stop()
 
-    await session_manager.stop()
     await telegram_app.stop()
     await telegram_app.shutdown()
     logger.info("Shutdown complete.")
@@ -1562,11 +1603,12 @@ async def lifespan(app: Starlette):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 if IS_RENDER:
     web_app = Starlette(routes=routes, lifespan=lifespan)
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"IS_RENDER=true — starting webhook server on port {port}")
+    logger.info(f"IS_RENDER=true \u2014 starting webhook server on port {port}")
     uvicorn.run(web_app, host="0.0.0.0", port=port)
 else:
-    logger.info("Local mode — starting polling...")
+    logger.info("Local mode \u2014 starting polling...")
     telegram_app.run_polling()
