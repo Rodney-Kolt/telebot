@@ -48,8 +48,8 @@ PO_DEMO = int(os.environ.get("PO_DEMO", "1"))  # 1 = demo, 0 = real
 
 # Signal photo URLs — override with env vars on Render, or use built-in defaults.
 # To use your own images: set SIGNAL_IMG_BUY and SIGNAL_IMG_SELL on Render dashboard.
-_DEFAULT_IMG_BUY  = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3e/Green_arrow_up.svg/240px-Green_arrow_up.svg.png"
-_DEFAULT_IMG_SELL = "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Red_Arrow_Down.svg/240px-Red_Arrow_Down.svg.png"
+_DEFAULT_IMG_BUY  = "https://i.ibb.co/HDC7G1D0/image.jpg"   # BUY (CALL) image
+_DEFAULT_IMG_SELL = "https://i.ibb.co/YTfbPc72/image.jpg"   # SELL (PUT) image
 
 SIGNAL_IMG_BUY  = os.environ.get("SIGNAL_IMG_BUY",  "").strip() or _DEFAULT_IMG_BUY
 SIGNAL_IMG_SELL = os.environ.get("SIGNAL_IMG_SELL", "").strip() or _DEFAULT_IMG_SELL
