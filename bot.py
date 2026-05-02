@@ -217,12 +217,16 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         po_ok = po_client is not None and po_client.is_connected
         ssid_preview = f"{SSID[:20]}...{SSID[-10:]}" if SSID and len(SSID) > 30 else str(SSID)
+        # Escape special Markdown characters
+        ssid_preview = ssid_preview.replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`')
+        
         await update.message.reply_text(
             f"🔧 *Debug Info*\n"
             f"IS_RENDER: `{IS_RENDER}`\n"
             f"RENDER_EXTERNAL_URL: `{RENDER_EXTERNAL_URL or 'not set'}`\n"
             f"SSID set: `{'✅' if SSID else '❌'}`\n"
-            f"SSID preview: `{ssid_preview}`\n"
+            f"SSID preview: {ssid_preview}\n"
+            f"PO client exists: `{'✅' if po_client else '❌'}`\n"
             f"PO client connected: `{'✅' if po_ok else '❌'}`\n"
             f"Signal: `{latest_signal['direction'] or 'none'}`\n"
             f"Last update: `{latest_signal['timestamp'] or 'never'}`",
