@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 import logging
 import math
@@ -95,6 +96,73 @@ DEFAULT_SETTINGS = {
 
 # Registry of all users who have ever sent /start — used for auto-broadcasts
 known_users: set[int] = set()
+
+# ---------------------------------------------------------------------------
+# Win/Loss tracking
+# ---------------------------------------------------------------------------
+STATS_FILE        = "stats.json"
+SIGNAL_EXPIRY_SEC = 600   # 10 minutes
+
+# Per-user stats: {user_id: {"total": int, "wins": int, "losses": int, "last_5": list}}
+user_stats: dict[int, dict] = {}
+
+# Pending signals awaiting a vote:
+# {signal_id: {"user_id": int, "ts": float, "voted": bool}}
+pending_signals: dict[str, dict] = {}
+
+
+def _load_stats() -> None:
+    """Load persisted stats from stats.json on startup."""
+    global user_stats
+    try:
+        if os.path.exists(STATS_FILE):
+            with open(STATS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            # Keys are stored as strings in JSON; convert back to int
+            user_stats = {int(k): v for k, v in raw.items()}
+            logger.info(f"Loaded stats for {len(user_stats)} users from {STATS_FILE}")
+    except Exception as exc:
+        logger.warning(f"Could not load stats: {exc}")
+
+
+def _save_stats() -> None:
+    """Persist stats to stats.json (best-effort)."""
+    try:
+        with open(STATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_stats, f)
+    except Exception as exc:
+        logger.warning(f"Could not save stats: {exc}")
+
+
+def _get_stats(user_id: int) -> dict:
+    if user_id not in user_stats:
+        user_stats[user_id] = {"total": 0, "wins": 0, "losses": 0, "last_5": []}
+    return user_stats[user_id]
+
+
+def _record_vote(user_id: int, won: bool) -> None:
+    s = _get_stats(user_id)
+    s["total"]  += 1
+    if won:
+        s["wins"] += 1
+        s["last_5"].append("👍")
+    else:
+        s["losses"] += 1
+        s["last_5"].append("👎")
+    s["last_5"] = s["last_5"][-5:]   # keep only last 5
+    _save_stats()
+
+
+def _make_signal_id(user_id: int) -> str:
+    """Generate a unique signal ID: timestamp_userid."""
+    return f"{int(time.time())}_{user_id}"
+
+
+def _vote_keyboard(signal_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("👍 Win",  callback_data=f"vote:win:{signal_id}"),
+        InlineKeyboardButton("👎 Loss", callback_data=f"vote:loss:{signal_id}"),
+    ]])
 
 # ---------------------------------------------------------------------------
 # Global signal state
@@ -711,6 +779,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Connection: {conn_str}\n\n"
         "Tap a button below, or use these commands:\n"
         "/signal \u2014 latest auto-signal\n"
+        "/stats \u2014 your win/loss statistics\n"
         "/autoon \u2014 enable auto-signals\n"
         "/autooff \u2014 disable auto-signals\n"
         "/status \u2014 connection status\n"
@@ -992,19 +1061,26 @@ async def _send_signal_message(
     price_str: str = "",
 ) -> None:
     """
-    Send a signal to a single chat_id.
+    Send a signal to a single chat_id with Win/Loss vote buttons.
     - HIGHER → send SIGNAL_IMG_BUY photo (fallback to text)
     - LOWER  → send SIGNAL_IMG_SELL photo (fallback to text)
-    - WAIT   → send plain text (no photo)
+    - WAIT   → skip (no broadcast)
     """
     direction = result["direction"]
-
     if direction == "WAIT":
-        # Don't broadcast WAIT signals
         return
 
-    img_url = SIGNAL_IMG_BUY if direction == "HIGHER" else SIGNAL_IMG_SELL
-    caption = _signal_caption(result, asset_label, tf_label, price_str)
+    # Create a unique signal ID and register it as pending
+    signal_id = _make_signal_id(chat_id)
+    pending_signals[signal_id] = {
+        "user_id": chat_id,
+        "ts":      time.time(),
+        "voted":   False,
+    }
+
+    img_url  = SIGNAL_IMG_BUY if direction == "HIGHER" else SIGNAL_IMG_SELL
+    caption  = _signal_caption(result, asset_label, tf_label, price_str)
+    keyboard = _vote_keyboard(signal_id)
 
     if img_url:
         try:
@@ -1012,6 +1088,7 @@ async def _send_signal_message(
                 chat_id=chat_id,
                 photo=img_url,
                 caption=caption,
+                reply_markup=keyboard,
             )
             return
         except Exception as exc:
@@ -1022,7 +1099,11 @@ async def _send_signal_message(
     if price_str:
         text += f"\nPrice: {price_str}"
     try:
-        await telegram_app.bot.send_message(chat_id=chat_id, text=text)
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_markup=keyboard,
+        )
     except Exception as exc:
         logger.error(f"send_message fallback also failed for {chat_id}: {exc}")
 
@@ -1274,24 +1355,109 @@ async def getssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the user's win/loss trading statistics."""
+    uid = update.effective_user.id
+    s   = _get_stats(uid)
+
+    total   = s["total"]
+    wins    = s["wins"]
+    losses  = s["losses"]
+    last_5  = " ".join(s["last_5"]) if s["last_5"] else "—"
+
+    win_pct  = f"{wins / total * 100:.1f}%" if total else "—"
+    loss_pct = f"{losses / total * 100:.1f}%" if total else "—"
+
+    await update.message.reply_text(
+        f"📊 Your Trading Stats\n\n"
+        f"Total signals: {total}\n"
+        f"Wins:   {wins} ({win_pct})\n"
+        f"Losses: {losses} ({loss_pct})\n"
+        f"Last 5: {last_5}"
+    )
+
+
+async def vote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 👍 Win / 👎 Loss button presses on signal messages."""
+    query = update.callback_query
+    data  = query.data  # format: "vote:win:<signal_id>" or "vote:loss:<signal_id>"
+
+    parts = data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Invalid vote data.")
+        return
+
+    _, outcome, signal_id = parts   # outcome = "win" or "loss"
+    user_id = query.from_user.id
+
+    # ── Look up the pending signal ────────────────────────────────────────
+    signal = pending_signals.get(signal_id)
+
+    if signal is None:
+        await query.answer("This signal is too old to vote on.")
+        return
+
+    # ── Expiry check ──────────────────────────────────────────────────────
+    if time.time() - signal["ts"] > SIGNAL_EXPIRY_SEC:
+        await query.answer("This signal has expired (10 min limit).")
+        pending_signals.pop(signal_id, None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    # ── Already voted ─────────────────────────────────────────────────────
+    if signal["voted"]:
+        await query.answer("Already recorded for this signal.")
+        return
+
+    # ── Record the vote ───────────────────────────────────────────────────
+    won = outcome == "win"
+    signal["voted"] = True
+    _record_vote(user_id, won)
+
+    label = "Win 👍" if won else "Loss 👎"
+    await query.answer(f"Recorded as {label}!")
+
+    # Replace buttons with a confirmation line
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(f"✅ Recorded: {label}", callback_data="vote:noop")
+            ]])
+        )
+    except Exception as exc:
+        logger.warning(f"Could not edit vote buttons: {exc}")
+
+
+async def vote_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Silently acknowledge taps on the 'Recorded' confirmation button."""
+    await update.callback_query.answer("Already recorded.")
+
+
 # ---------------------------------------------------------------------------
 # Register handlers
 # ---------------------------------------------------------------------------
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
-        CallbackQueryHandler(button_handler),
+        CallbackQueryHandler(button_handler, pattern="^(?!vote:)"),
     ],
     states={
-        CHOOSE_ASSET: [CallbackQueryHandler(button_handler)],
-        CHOOSE_TIME:  [CallbackQueryHandler(button_handler)],
+        CHOOSE_ASSET: [CallbackQueryHandler(button_handler, pattern="^(?!vote:)")],
+        CHOOSE_TIME:  [CallbackQueryHandler(button_handler, pattern="^(?!vote:)")],
     },
     fallbacks=[CommandHandler("start", start)],
     per_message=False,
 )
 
 telegram_app.add_handler(conv_handler)
+# Vote handlers run outside ConversationHandler so they always fire
+telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler, pattern="^vote:noop$"))
+telegram_app.add_handler(CallbackQueryHandler(vote_handler,      pattern="^vote:(win|loss):"))
 telegram_app.add_handler(CommandHandler("signal",    signal_command))
+telegram_app.add_handler(CommandHandler("stats",     stats_command))
 telegram_app.add_handler(CommandHandler("autoon",    autoon_command))
 telegram_app.add_handler(CommandHandler("autooff",   autooff_command))
 telegram_app.add_handler(CommandHandler("status",    status_command))
@@ -1356,6 +1522,9 @@ async def lifespan(app: Starlette):
     await telegram_app.initialize()
     await telegram_app.start()
     await reset_and_set_webhook()
+
+    # Load persisted win/loss stats
+    _load_stats()
 
     # Pre-register CHAT_ID as a known user so /autooff works from the first signal
     if CHAT_ID:
