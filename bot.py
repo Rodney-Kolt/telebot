@@ -213,9 +213,13 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Return the latest signal computed from live Pocket Option data."""
     sig = latest_signal
     if sig["direction"] is None:
+        po_status = "🟢 Connected" if getattr(po_client, 'connected', False) else "🔴 Not connected"
         await update.message.reply_text(
-            "⏳ No signal yet — waiting for Pocket Option data...\n"
-            "Make sure PO_SESSION and PO_UID are set correctly."
+            f"⏳ No signal yet — Pocket Option hasn't sent data.\n\n"
+            f"PO WebSocket: {po_status}\n"
+            f"Session parsed: {'✅' if PO_SESSION else '❌'}\n"
+            f"UID: {PO_UID_PARSED}\n\n"
+            f"If PO shows 🔴, check that SSID is set correctly in Render."
         )
         return
     price_str = f"{sig['price']:.5f}" if sig["price"] else "N/A"
@@ -242,9 +246,27 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detailed diagnostics — helps confirm SSID parsed correctly and WS state."""
+    po_status = "🟢 Connected" if getattr(po_client, 'connected', False) else "🔴 Disconnected"
+    session_preview = f"{PO_SESSION[:10]}...{PO_SESSION[-4:]}" if PO_SESSION and len(PO_SESSION) > 14 else str(PO_SESSION)
+    await update.message.reply_text(
+        f"🔧 *Debug Info*\n"
+        f"PO WebSocket: {po_status}\n"
+        f"Session (masked): `{session_preview}`\n"
+        f"UID: `{PO_UID_PARSED}`\n"
+        f"Asset: `{TRADE_ASSET}`\n"
+        f"Candle period: {CANDLE_PERIOD}s\n"
+        f"IS_RENDER: {IS_RENDER}\n"
+        f"Signal state: {latest_signal['direction'] or 'none'}",
+        parse_mode='Markdown'
+    )
+
+
 telegram_app.add_handler(CommandHandler("start", start))
 telegram_app.add_handler(CommandHandler("signal", signal_command))
 telegram_app.add_handler(CommandHandler("status", status_command))
+telegram_app.add_handler(CommandHandler("debug", debug_command))
 
 
 # ---------------------------------------------------------------------------
