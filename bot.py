@@ -1,8 +1,6 @@
 import os
 import asyncio
 import logging
-import json
-import re
 import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -13,16 +11,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from pocket_option import PocketOptionClient
-from pocket_option.constants import Regions
-from pocket_option.contrib.candles import MemoryCandleStorage
-from pocket_option.models import (
-    Asset,
-    AuthorizationData,
-    ChangeAssetRequest,
-    SuccessAuthEvent,
-    UpdateCloseValueItem,
-)
+from pocketoptionapi_async import PocketOption
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -41,47 +30,21 @@ if not TOKEN:
     raise ValueError("No BOT_TOKEN environment variable set")
 
 CHAT_ID = os.environ.get("CHAT_ID")
-SIGNAL_INTERVAL = int(os.environ.get("SIGNAL_INTERVAL", 300))
-
 IS_RENDER = os.environ.get("RENDER") == "true"
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 
+# Full SSID string from browser DevTools:
+# 42["auth",{"session":"...","isDemo":1,"uid":...,"platform":1}]
 SSID = os.environ.get("SSID")
 if not SSID:
     raise ValueError("SSID environment variable not set")
 
-# Optional: numeric uid. Required by the API but not critical in demo mode.
-PO_UID = int(os.environ.get("PO_UID", "0"))
-
-TRADE_ASSET = Asset.EURUSD_otc
-CANDLE_PERIOD = 60  # 1-minute candles
+TRADE_ASSET = "EURUSD_otc"
+CANDLE_PERIOD = 60   # seconds
+CANDLE_COUNT  = 10   # how many candles to fetch for signal
 
 # ---------------------------------------------------------------------------
-# SSID parser
-# Supports two formats:
-#   1. Full WS auth string: 42["auth",{"session":"...","uid":123,...}]
-#   2. Raw session string:  A6ApZ88gUyEt74yQh,,Ai-Q3sLv75FvWTvWK
-# ---------------------------------------------------------------------------
-def parse_ssid(ssid_string: str) -> tuple[str, int]:
-    """
-    Parse the SSID env var into (session, uid).
-    Handles both the full WebSocket auth message and a bare session string.
-    """
-    ssid_string = ssid_string.strip()
-    # Try full WS auth format first: 42["auth",{...}]
-    match = re.search(r'42\["auth",(\{.*?\})\]', ssid_string)
-    if match:
-        data = json.loads(match.group(1))
-        return data["session"], int(data.get("uid", PO_UID))
-    # Fall back: treat the whole string as a raw session token
-    return ssid_string, PO_UID
-
-
-PO_SESSION, PO_UID_PARSED = parse_ssid(SSID)
-logger.info(f"Parsed PO_SESSION (first 8 chars): {PO_SESSION[:8]}... uid={PO_UID_PARSED}")
-
-# ---------------------------------------------------------------------------
-# Global signal state — updated on every price tick
+# Global signal state — updated by the background loop
 # ---------------------------------------------------------------------------
 latest_signal: dict = {
     "direction": None,
@@ -90,26 +53,22 @@ latest_signal: dict = {
     "timestamp": None,
 }
 
-# ---------------------------------------------------------------------------
-# Pocket Option client + candle storage
-# ---------------------------------------------------------------------------
-po_client = PocketOptionClient()
-candle_storage = MemoryCandleStorage(po_client)
+# Module-level PocketOption client (created once, reused)
+po_client: PocketOption | None = None
 
 
 # ---------------------------------------------------------------------------
-# Signal logic — 3-candle momentum
+# Signal logic — 3-candle momentum on closing prices
 # ---------------------------------------------------------------------------
-def compute_signal() -> tuple[str, str]:
+def compute_signal(candles: list) -> tuple[str, str]:
     """
     Returns (direction, reason).
-    direction: "CALL ✅" | "PUT ❌" | "WAIT ⏸"
+    Needs at least 4 candles; uses the last 4 closing prices.
     """
+    if not candles or len(candles) < 4:
+        return "WAIT ⏸", "Not enough candle data yet"
     try:
-        candles = candle_storage.get_candles(TRADE_ASSET, CANDLE_PERIOD, count=4)
-        if not candles or len(candles) < 4:
-            return "WAIT ⏸", "Not enough candle data yet"
-        closes = [c.close for c in candles[-4:]]
+        closes = [float(c["close"]) for c in candles[-4:]]
         if closes[-1] > closes[-2] > closes[-3] > closes[-4]:
             return "CALL ✅", "3 consecutive rising closes (bullish momentum)"
         if closes[-1] < closes[-2] < closes[-3] < closes[-4]:
@@ -117,80 +76,82 @@ def compute_signal() -> tuple[str, str]:
         return "WAIT ⏸", "No clear momentum"
     except Exception as e:
         logger.warning(f"compute_signal error: {e}")
-        return "WAIT ⏸", f"Error: {e}"
+        return "WAIT ⏸", f"Signal error: {e}"
 
 
 # ---------------------------------------------------------------------------
-# Pocket Option event handlers
+# Background task — connects to Pocket Option and polls for candles
 # ---------------------------------------------------------------------------
-@po_client.on.connect
-async def on_po_connect(data: None):
-    logger.info("Pocket Option WebSocket connected — authenticating...")
-    await po_client.emit.auth(
-        AuthorizationData.model_validate({
-            "session": PO_SESSION,
-            "isDemo": 1,
-            "uid": PO_UID_PARSED,
-            "platform": 2,
-            "isFastHistory": True,
-            "isOptimized": True,
-        })
-    )
-
-
-@po_client.on.success_auth
-async def on_po_auth(data: SuccessAuthEvent):
-    logger.info(f"Pocket Option authenticated — uid={data.id}")
-    await po_client.emit.subscribe_to_asset(TRADE_ASSET)
-    await po_client.emit.change_asset(
-        ChangeAssetRequest(asset=TRADE_ASSET, period=CANDLE_PERIOD)
-    )
-    logger.info(f"Subscribed to {TRADE_ASSET} @ {CANDLE_PERIOD}s candles")
-
-
-@po_client.on.update_close_value
-async def on_price_update(assets: list[UpdateCloseValueItem]):
+async def pocket_option_loop():
     """
-    Fires on every real-time price tick from Pocket Option.
-    Updates latest_signal and broadcasts CALL/PUT signals to the chat.
+    Connects to Pocket Option, then polls for candle data every 60 seconds.
+    Updates latest_signal on each tick and broadcasts CALL/PUT to Telegram.
     """
-    global latest_signal
+    global po_client, latest_signal
 
-    direction, reason = compute_signal()
+    logger.info("Pocket Option loop starting...")
 
-    # Get the latest price from the tick data if available
-    price = None
-    if assets:
+    # isDemo=1 for demo account (matches your SSID)
+    po_client = PocketOption(ssid=SSID, demo=True)
+
+    try:
+        connected = await po_client.connect()
+        if not connected:
+            logger.error("Pocket Option: failed to connect. Check SSID.")
+            return
+        logger.info("Pocket Option: connected successfully.")
+    except Exception as e:
+        logger.error(f"Pocket Option connect error: {e}")
+        return
+
+    while True:
         try:
-            price = assets[0].price
-        except AttributeError:
-            pass
-
-    latest_signal = {
-        "direction": direction,
-        "price": price,
-        "reason": reason,
-        "timestamp": str(datetime.now()),
-    }
-
-    # Broadcast only actionable signals (not WAIT)
-    if CHAT_ID and direction != "WAIT ⏸":
-        try:
-            price_str = f"{price:.5f}" if price else "N/A"
-            message = (
-                f"📡 *Live Signal*\n"
-                f"Asset: `EURUSD OTC`\n"
-                f"Direction: *{direction}*\n"
-                f"Price: `{price_str}`\n"
-                f"Reason: {reason}\n"
-                f"Time: {datetime.now().strftime('%H:%M:%S')}"
+            candles = await po_client.get_candles(
+                asset=TRADE_ASSET,
+                period=CANDLE_PERIOD,
+                count=CANDLE_COUNT,
             )
-            await telegram_app.bot.send_message(
-                chat_id=CHAT_ID, text=message, parse_mode='Markdown'
-            )
-            logger.info(f"Live signal broadcast: {direction}")
+
+            direction, reason = compute_signal(candles)
+
+            # Try to get latest price from most recent candle
+            price = None
+            if candles:
+                try:
+                    price = float(candles[-1]["close"])
+                except (KeyError, TypeError, ValueError):
+                    pass
+
+            latest_signal = {
+                "direction": direction,
+                "price": price,
+                "reason": reason,
+                "timestamp": str(datetime.now()),
+            }
+            logger.info(f"Signal updated: {direction} | {reason}")
+
+            # Broadcast actionable signals to Telegram
+            if CHAT_ID and direction != "WAIT ⏸":
+                price_str = f"{price:.5f}" if price else "N/A"
+                message = (
+                    f"📡 *Live Signal*\n"
+                    f"Asset: `EURUSD OTC`\n"
+                    f"Direction: *{direction}*\n"
+                    f"Price: `{price_str}`\n"
+                    f"Reason: {reason}\n"
+                    f"Time: {datetime.now().strftime('%H:%M:%S')}"
+                )
+                try:
+                    await telegram_app.bot.send_message(
+                        chat_id=CHAT_ID, text=message, parse_mode='Markdown'
+                    )
+                except Exception as e:
+                    logger.error(f"Telegram send error: {e}")
+
         except Exception as e:
-            logger.error(f"Failed to broadcast signal: {e}")
+            logger.error(f"Pocket Option loop error: {e}")
+
+        await asyncio.sleep(CANDLE_PERIOD)
 
 
 # ---------------------------------------------------------------------------
@@ -203,23 +164,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 *Real-time Signal Bot is running!*\n\n"
         "Commands:\n"
-        "• /signal — get the current real-time signal\n"
-        "• /status — check bot and connection status",
+        "• /signal — current real-time signal\n"
+        "• /status — connection and bot status\n"
+        "• /debug  — detailed diagnostics",
         parse_mode='Markdown'
     )
 
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Return the latest signal computed from live Pocket Option data."""
     sig = latest_signal
     if sig["direction"] is None:
-        po_status = "🟢 Connected" if getattr(po_client, 'connected', False) else "🔴 Not connected"
+        po_ok = po_client is not None
         await update.message.reply_text(
-            f"⏳ No signal yet — Pocket Option hasn't sent data.\n\n"
-            f"PO WebSocket: {po_status}\n"
-            f"Session parsed: {'✅' if PO_SESSION else '❌'}\n"
-            f"UID: {PO_UID_PARSED}\n\n"
-            f"If PO shows 🔴, check that SSID is set correctly in Render."
+            f"⏳ No signal yet.\n\n"
+            f"PO client initialised: {'✅' if po_ok else '❌'}\n"
+            f"Waiting for first candle poll (up to 60s after startup).\n"
+            f"If this persists, use /debug to check connection."
         )
         return
     price_str = f"{sig['price']:.5f}" if sig["price"] else "N/A"
@@ -235,30 +195,29 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    po_status = "🟢 Connected" if getattr(po_client, 'connected', False) else "🔴 Disconnected"
+    po_ok = po_client is not None
     sig = latest_signal
     await update.message.reply_text(
         f"✅ *Bot Status*\n"
         f"Server time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Pocket Option: {po_status}\n"
+        f"PO client: {'🟢 Running' if po_ok else '🔴 Not started'}\n"
         f"Last signal: {sig['direction'] or 'none'} @ {sig['timestamp'] or 'never'}",
         parse_mode='Markdown'
     )
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detailed diagnostics — helps confirm SSID parsed correctly and WS state."""
-    po_status = "🟢 Connected" if getattr(po_client, 'connected', False) else "🔴 Disconnected"
-    session_preview = f"{PO_SESSION[:10]}...{PO_SESSION[-4:]}" if PO_SESSION and len(PO_SESSION) > 14 else str(PO_SESSION)
+    po_ok = po_client is not None
+    ssid_preview = f"{SSID[:20]}...{SSID[-10:]}" if SSID and len(SSID) > 30 else str(SSID)
     await update.message.reply_text(
         f"🔧 *Debug Info*\n"
-        f"PO WebSocket: {po_status}\n"
-        f"Session (masked): `{session_preview}`\n"
-        f"UID: `{PO_UID_PARSED}`\n"
-        f"Asset: `{TRADE_ASSET}`\n"
-        f"Candle period: {CANDLE_PERIOD}s\n"
-        f"IS_RENDER: {IS_RENDER}\n"
-        f"Signal state: {latest_signal['direction'] or 'none'}",
+        f"IS_RENDER: `{IS_RENDER}`\n"
+        f"RENDER_EXTERNAL_URL: `{RENDER_EXTERNAL_URL or 'not set'}`\n"
+        f"SSID set: `{'✅' if SSID else '❌'}`\n"
+        f"SSID preview: `{ssid_preview}`\n"
+        f"PO client: `{'initialised' if po_ok else 'None'}`\n"
+        f"Signal: `{latest_signal['direction'] or 'none'}`\n"
+        f"Last update: `{latest_signal['timestamp'] or 'never'}`",
         parse_mode='Markdown'
     )
 
@@ -270,7 +229,7 @@ telegram_app.add_handler(CommandHandler("debug", debug_command))
 
 
 # ---------------------------------------------------------------------------
-# Telegram webhook registration (raw HTTP)
+# Telegram webhook registration
 # ---------------------------------------------------------------------------
 async def reset_and_set_webhook():
     if not RENDER_EXTERNAL_URL:
@@ -292,7 +251,7 @@ async def health(request: Request):
     return JSONResponse({
         "status": "healthy",
         "timestamp": str(datetime.now()),
-        "po_connected": getattr(po_client, 'connected', False),
+        "po_running": po_client is not None,
         "latest_signal": latest_signal,
     })
 
@@ -311,34 +270,37 @@ routes = [
 
 
 # ---------------------------------------------------------------------------
-# Lifespan (Render / webhook mode only)
+# Lifespan
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: Starlette):
-    # --- Startup ---
     logger.info("Starting up — webhook mode (Render)...")
 
     await telegram_app.initialize()
     await telegram_app.start()
     await reset_and_set_webhook()
 
-    # Connect Pocket Option WebSocket as a background task
-    po_task = asyncio.create_task(po_client.connect(Regions.DEMO))
-    logger.info("Pocket Option WebSocket task started.")
+    # Start Pocket Option background loop
+    po_task = asyncio.create_task(pocket_option_loop())
+    logger.info("Pocket Option background task created.")
 
     yield
 
-    # --- Shutdown ---
     po_task.cancel()
     try:
         await po_task
     except (asyncio.CancelledError, Exception):
         pass
-    logger.info("Pocket Option task stopped.")
+
+    if po_client:
+        try:
+            await po_client.disconnect()
+        except Exception:
+            pass
 
     await telegram_app.stop()
     await telegram_app.shutdown()
-    logger.info("Telegram app shut down.")
+    logger.info("Shutdown complete.")
 
 
 # ---------------------------------------------------------------------------
