@@ -75,6 +75,11 @@ async def lifespan(app):
     await telegram_app.initialize()
     await telegram_app.start()
 
+    # Always clear any existing webhook/polling state first to avoid Conflict errors.
+    # drop_pending_updates=True discards any queued updates from the old session.
+    await telegram_app.bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Cleared any existing webhook/polling state.")
+
     # Register the webhook with Telegram so it knows where to send updates
     if RENDER_URL:
         webhook_url = f"{RENDER_URL}/telegram"
