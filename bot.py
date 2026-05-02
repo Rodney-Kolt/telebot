@@ -674,7 +674,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"\U0001f44b Welcome, {name}!\n\n"
         "\U0001f4e1 OTC Signal Bot\n"
         f"Connection: {conn_str}\n\n"
-        "Choose an option below:"
+        "Tap a button below, or use these commands:\n"
+        "/signal \u2014 latest auto-signal\n"
+        "/status \u2014 connection status\n"
+        "/getssid \u2014 show current SSID info\n"
+        "/setssid <string> \u2014 update SSID without redeploying\n"
+        "/reconnect \u2014 force reconnect\n"
+        "/logs \u2014 recent errors\n"
+        "/debug \u2014 full diagnostics"
     )
     if update.message:
         await update.message.reply_text(text, reply_markup=_main_menu_keyboard(uid))
@@ -879,7 +886,7 @@ def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
         f"RSI: {rsi_str}\n"
         f"Market: {market}\n"
         f"Reason: {reason}\n"
-        f"Time: {__import__('datetime').datetime.now().strftime('%H:%M:%S')}"
+        f"Time: {datetime.now().strftime('%H:%M:%S')}"
     )
 
 
@@ -950,63 +957,131 @@ async def reconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Session manager not initialised yet.")
 
 
+def _parse_uid_from_ssid(ssid: str) -> str | None:
+    """Extract the uid value from a 42["auth",{...}] string."""
+    try:
+        # Strip the leading "42" and parse the JSON array
+        payload = json.loads(ssid[2:])   # ["auth", {...}]
+        if isinstance(payload, list) and len(payload) >= 2:
+            return str(payload[1].get("uid", ""))
+    except Exception:
+        pass
+    return None
+
+
 async def setssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Update the SSID at runtime without redeploying.
 
-    Usage:  /setssid 42["auth",{"session":"...","isDemo":1,"uid":123,"platform":1}]
+    Usage:
+        /setssid 42["auth",{"session":"...","isDemo":1,"uid":123,"platform":1}]
 
-    The new SSID is stored in the SessionManager and used immediately for
-    reconnection. It is NOT persisted to disk — if the service restarts you
-    will need to update the SSID env var on Render as well.
+    The new SSID is applied immediately. It is NOT persisted to disk — also
+    update the SSID env var on Render so it survives a service restart.
     """
     global SSID
 
+    HELP = (
+        "Usage: /setssid <full auth string>\n\n"
+        "How to get a fresh SSID:\n"
+        "1. Open pocketoption.com and log in (demo or real)\n"
+        "2. Press F12 to open DevTools\n"
+        "3. Go to Network tab and filter by WS\n"
+        "4. Click the WebSocket connection\n"
+        "5. Open the Messages tab\n"
+        '6. Find the message starting with 42["auth",\n'
+        "7. Copy the entire string\n"
+        "8. Send: /setssid <paste here>\n\n"
+        "Example:\n"
+        '/setssid 42["auth",{"session":"abc123","isDemo":1,"uid":441012369,"platform":1}]'
+    )
+
     if not context.args:
-        await update.message.reply_text(
-            "Usage: /setssid <full auth string>\n\n"
-            'Example:\n/setssid 42["auth",{"session":"abc...","isDemo":1,"uid":123,"platform":1}]\n\n'
-            "How to get a fresh SSID:\n"
-            "1. Open pocketoption.com and log in\n"
-            "2. Press F12 → Network tab → filter WS\n"
-            "3. Click the WebSocket connection → Messages tab\n"
-            '4. Find the message starting with 42["auth",\n'
-            "5. Copy the entire string and paste it after /setssid"
-        )
+        await update.message.reply_text(HELP)
         return
 
     new_ssid = " ".join(context.args).strip()
 
-    # Basic validation
+    # ── Validation ───────────────────────────────────────────────────────
     if not (new_ssid.startswith('42["auth"') or new_ssid.startswith("42['auth'")):
         await update.message.reply_text(
-            'Invalid format. The SSID must start with: 42["auth",\n\n'
-            "Copy the full WebSocket auth message from your browser DevTools."
+            '❌ Invalid format — must start with: 42["auth",\n\n' + HELP
         )
         return
 
+    if '"session"' not in new_ssid and "'session'" not in new_ssid:
+        await update.message.reply_text(
+            '❌ Invalid SSID — missing "session" field.\n\n' + HELP
+        )
+        return
+
+    if '"uid"' not in new_ssid and "'uid'" not in new_ssid:
+        await update.message.reply_text(
+            '❌ Invalid SSID — missing "uid" field.\n\n' + HELP
+        )
+        return
+
+    uid_str = _parse_uid_from_ssid(new_ssid)
+    preview = f"{new_ssid[:30]}...{new_ssid[-10:]}" if len(new_ssid) > 40 else new_ssid
+
+    # ── Apply ────────────────────────────────────────────────────────────
     SSID = new_ssid
     if session_manager:
         session_manager.ssid = new_ssid
 
-    await update.message.reply_text("SSID updated. Reconnecting now...")
+    await update.message.reply_text(
+        f"SSID received. Reconnecting...\n"
+        f"Preview: {preview}\n"
+        f"UID: {uid_str or 'could not parse'}"
+    )
 
     if session_manager:
         async with session_manager._lock:
             success = await session_manager._connect()
         if success:
             await update.message.reply_text(
-                "Connected successfully with new SSID.\n\n"
-                "Remember to also update the SSID env var on Render so it "
-                "survives a service restart."
+                f"✅ Connected successfully!\n"
+                f"SSID starts with: {new_ssid[:30]}...\n"
+                f"UID: {uid_str or 'N/A'}\n\n"
+                "Also update the SSID env var on Render so it survives a restart."
             )
         else:
             await update.message.reply_text(
-                "Reconnect failed — the new SSID may also be invalid or expired.\n"
-                "Check /logs for details."
+                "❌ Reconnect failed — the SSID may be invalid or already expired.\n"
+                "Check /logs for the exact error, then try a fresh SSID."
             )
     else:
         await update.message.reply_text("Session manager not initialised yet.")
+
+
+async def getssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the current SSID preview and uid for debugging."""
+    current_ssid = session_manager.ssid if session_manager else SSID
+    uid_str      = _parse_uid_from_ssid(current_ssid) if current_ssid else None
+    po_ok        = session_manager is not None and session_manager.is_connected
+
+    if not current_ssid:
+        await update.message.reply_text("No SSID is currently set.")
+        return
+
+    preview = (
+        f"{current_ssid[:30]}...{current_ssid[-10:]}"
+        if len(current_ssid) > 40 else current_ssid
+    )
+
+    connected_since = (
+        session_manager.connected_at.strftime("%Y-%m-%d %H:%M:%S")
+        if session_manager and session_manager.connected_at else "never"
+    )
+
+    await update.message.reply_text(
+        f"Current SSID Info\n\n"
+        f"Preview: {preview}\n"
+        f"UID: {uid_str or 'could not parse'}\n"
+        f"Connected: {'yes' if po_ok else 'no'}\n"
+        f"Connected since: {connected_since}\n\n"
+        "To update: /setssid <new_ssid>"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1031,6 +1106,7 @@ telegram_app.add_handler(CommandHandler("debug",     debug_command))
 telegram_app.add_handler(CommandHandler("logs",      logs_command))
 telegram_app.add_handler(CommandHandler("reconnect", reconnect_command))
 telegram_app.add_handler(CommandHandler("setssid",   setssid_command))
+telegram_app.add_handler(CommandHandler("getssid",   getssid_command))
 
 
 # ---------------------------------------------------------------------------
