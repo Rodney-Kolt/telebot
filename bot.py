@@ -604,17 +604,20 @@ async def pocket_option_loop() -> None:
                 price_str = f"{price:.5f}" if price else "N/A"
 
                 # Build recipients: known_users who have auto ON
-                # CHAT_ID is only included if it belongs to a known user with auto ON,
-                # or if no users have started the bot yet (bootstrap fallback)
                 recipients: set[int] = {
                     uid for uid in known_users
                     if _get_settings(uid).get("auto", True)
                 }
 
                 # Bootstrap fallback: if nobody has /start-ed yet, still notify CHAT_ID
-                if not known_users and CHAT_ID:
+                # but only if CHAT_ID itself has auto ON (or hasn't opted out yet)
+                if CHAT_ID:
                     try:
-                        recipients.add(int(CHAT_ID))
+                        chat_id_int = int(CHAT_ID)
+                        # Always register CHAT_ID as a known user so auto-setting applies
+                        known_users.add(chat_id_int)
+                        if _get_settings(chat_id_int).get("auto", True):
+                            recipients.add(chat_id_int)
                     except ValueError:
                         pass
 
@@ -1353,6 +1356,14 @@ async def lifespan(app: Starlette):
     await telegram_app.initialize()
     await telegram_app.start()
     await reset_and_set_webhook()
+
+    # Pre-register CHAT_ID as a known user so /autooff works from the first signal
+    if CHAT_ID:
+        try:
+            known_users.add(int(CHAT_ID))
+            logger.info(f"Pre-registered CHAT_ID {CHAT_ID} in known_users")
+        except ValueError:
+            pass
 
     # Create and start the session manager
     session_manager = SessionManager(ssid=SSID, is_demo=bool(PO_DEMO))
