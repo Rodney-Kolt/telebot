@@ -306,12 +306,13 @@ class SessionManager:
         log_error("All reconnect attempts failed — SSID needs manual refresh")
         await _telegram_notify(
             "⚠️ Pocket Option connection lost and could not reconnect.\n\n"
-            "Your SSID has likely expired. To fix:\n"
-            "1. Open pocketoption.com in your browser\n"
+            "Your SSID has likely expired. To fix without redeploying:\n"
+            "1. Open pocketoption.com and log in\n"
             "2. Press F12 → Network tab → filter WS\n"
             '3. Find the message starting with 42["auth",\n'
-            "4. Copy the full message\n"
-            "5. Update the SSID env var on Render and redeploy"
+            "4. Copy the full string\n"
+            "5. Send: /setssid <paste the string here>\n\n"
+            "The bot will reconnect immediately."
         )
 
 
@@ -943,7 +944,66 @@ async def reconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         else:
             await update.message.reply_text(
                 "Reconnect failed. Check /logs for details.\n"
-                "If SSID is expired, update it on Render and redeploy."
+                "If SSID is expired, use /setssid <new_ssid> to update it without redeploying."
+            )
+    else:
+        await update.message.reply_text("Session manager not initialised yet.")
+
+
+async def setssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Update the SSID at runtime without redeploying.
+
+    Usage:  /setssid 42["auth",{"session":"...","isDemo":1,"uid":123,"platform":1}]
+
+    The new SSID is stored in the SessionManager and used immediately for
+    reconnection. It is NOT persisted to disk — if the service restarts you
+    will need to update the SSID env var on Render as well.
+    """
+    global SSID
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /setssid <full auth string>\n\n"
+            'Example:\n/setssid 42["auth",{"session":"abc...","isDemo":1,"uid":123,"platform":1}]\n\n'
+            "How to get a fresh SSID:\n"
+            "1. Open pocketoption.com and log in\n"
+            "2. Press F12 → Network tab → filter WS\n"
+            "3. Click the WebSocket connection → Messages tab\n"
+            '4. Find the message starting with 42["auth",\n'
+            "5. Copy the entire string and paste it after /setssid"
+        )
+        return
+
+    new_ssid = " ".join(context.args).strip()
+
+    # Basic validation
+    if not (new_ssid.startswith('42["auth"') or new_ssid.startswith("42['auth'")):
+        await update.message.reply_text(
+            'Invalid format. The SSID must start with: 42["auth",\n\n'
+            "Copy the full WebSocket auth message from your browser DevTools."
+        )
+        return
+
+    SSID = new_ssid
+    if session_manager:
+        session_manager.ssid = new_ssid
+
+    await update.message.reply_text("SSID updated. Reconnecting now...")
+
+    if session_manager:
+        async with session_manager._lock:
+            success = await session_manager._connect()
+        if success:
+            await update.message.reply_text(
+                "Connected successfully with new SSID.\n\n"
+                "Remember to also update the SSID env var on Render so it "
+                "survives a service restart."
+            )
+        else:
+            await update.message.reply_text(
+                "Reconnect failed — the new SSID may also be invalid or expired.\n"
+                "Check /logs for details."
             )
     else:
         await update.message.reply_text("Session manager not initialised yet.")
@@ -970,6 +1030,7 @@ telegram_app.add_handler(CommandHandler("status",    status_command))
 telegram_app.add_handler(CommandHandler("debug",     debug_command))
 telegram_app.add_handler(CommandHandler("logs",      logs_command))
 telegram_app.add_handler(CommandHandler("reconnect", reconnect_command))
+telegram_app.add_handler(CommandHandler("setssid",   setssid_command))
 
 
 # ---------------------------------------------------------------------------
