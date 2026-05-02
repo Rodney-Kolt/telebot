@@ -90,7 +90,7 @@ user_settings: dict[int, dict] = {}
 DEFAULT_SETTINGS = {
     "asset":     "EUR/USD (OTC)",
     "timeframe": "1 minute",
-    "auto":      True,          # receive auto-broadcast signals
+    "auto":      False,         # auto-signals OFF by default; user must opt in
 }
 
 # Registry of all users who have ever sent /start — used for auto-broadcasts
