@@ -103,19 +103,49 @@ _AUTH_ERROR_MARKERS = (
 def _load_user_configs() -> list[dict]:
     """
     Parse USERS_CONFIG env var (JSON array) or fall back to single-user SSID+CHAT_ID.
-    Returns list of dicts: [{"name": str, "chat_id": int, "ssid": str, "is_demo": bool}]
+    Returns list of dicts: [{"name", "chat_id", "ssid", "is_demo", "broadcast_ids"}]
+
+    Each entry may include an optional "broadcast_ids" list of extra chat IDs that
+    receive auto-signal broadcasts from this account (in addition to chat_id itself).
+
+    Alternatively, set BROADCAST_CHAT_IDS="id1,id2" as a global env var to add
+    extra recipients to every user session.
     """
+    # Global extra broadcast IDs (comma-separated env var)
+    global_extra: list[int] = []
+    raw_extra = os.environ.get("BROADCAST_CHAT_IDS", "").strip()
+    if raw_extra:
+        for part in raw_extra.split(","):
+            part = part.strip()
+            if part:
+                try:
+                    global_extra.append(int(part))
+                except ValueError:
+                    logger.warning(f"Invalid chat ID in BROADCAST_CHAT_IDS: {part!r}")
+        if global_extra:
+            logger.info(f"Global broadcast IDs: {global_extra}")
+
     raw = os.environ.get("USERS_CONFIG", "").strip()
     if raw:
         try:
             configs = json.loads(raw)
             result = []
             for c in configs:
+                # Per-user extra broadcast IDs from config
+                per_user_extra: list[int] = []
+                for cid in c.get("broadcast_ids", []):
+                    try:
+                        per_user_extra.append(int(cid))
+                    except (ValueError, TypeError):
+                        pass
+                # Merge global + per-user extras (deduplicated)
+                all_extra = list(dict.fromkeys(per_user_extra + global_extra))
                 result.append({
-                    "name":    c.get("name", f"User_{c['chat_id']}"),
-                    "chat_id": int(c["chat_id"]),
-                    "ssid":    c["ssid"],
-                    "is_demo": bool(int(c.get("is_demo", 1))),
+                    "name":          c.get("name", f"User_{c['chat_id']}"),
+                    "chat_id":       int(c["chat_id"]),
+                    "ssid":          c["ssid"],
+                    "is_demo":       bool(int(c.get("is_demo", 1))),
+                    "broadcast_ids": all_extra,
                 })
             logger.info(f"Loaded {len(result)} users from USERS_CONFIG")
             return result
@@ -128,10 +158,11 @@ def _load_user_configs() -> list[dict]:
     if ssid and chat_id:
         logger.info("Using single-user fallback (SSID + CHAT_ID)")
         return [{
-            "name":    "Default",
-            "chat_id": int(chat_id),
-            "ssid":    ssid,
-            "is_demo": bool(int(os.environ.get("PO_DEMO", "1"))),
+            "name":          "Default",
+            "chat_id":       int(chat_id),
+            "ssid":          ssid,
+            "is_demo":       bool(int(os.environ.get("PO_DEMO", "1"))),
+            "broadcast_ids": global_extra,
         }]
 
     raise ValueError("No user config found. Set USERS_CONFIG or SSID+CHAT_ID env vars.")
@@ -143,9 +174,13 @@ def _load_user_configs() -> list[dict]:
 @dataclass
 class UserSession:
     name:     str
-    chat_id:  int
+    chat_id:  int          # primary chat — owns the SSID, receives commands
     ssid:     str
     is_demo:  bool
+
+    # Additional chat IDs that receive auto-signal broadcasts from this account.
+    # The primary chat_id is always included automatically.
+    broadcast_ids: list[int] = field(default_factory=list)
 
     # Created after init
     session_manager: "SessionManager | None" = field(default=None, repr=False)
@@ -154,6 +189,14 @@ class UserSession:
         "direction": None, "price": None, "reason": None, "timestamp": None
     })
     poll_task: "asyncio.Task | None" = field(default=None, repr=False)
+
+    def all_broadcast_ids(self) -> list[int]:
+        """Return the full broadcast list: primary chat_id + any extras."""
+        ids = [self.chat_id]
+        for cid in self.broadcast_ids:
+            if cid not in ids:
+                ids.append(cid)
+        return ids
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -692,13 +735,15 @@ async def _user_poll_loop(us: UserSession) -> None:
             if direction != "WAIT \u23f8" and us.settings.get("auto", False):
                 result    = compute_signal_advanced(candles)
                 price_str = f"{price:.5f}" if price else "N/A"
-                await _send_signal_message(
-                    chat_id=us.chat_id,
-                    result=result,
-                    asset_label="EUR/USD (OTC)",
-                    tf_label="1 minute",
-                    price_str=price_str,
-                )
+                # Broadcast to primary chat + all extra broadcast IDs
+                for cid in us.all_broadcast_ids():
+                    await _send_signal_message(
+                        chat_id=cid,
+                        result=result,
+                        asset_label="EUR/USD (OTC)",
+                        tf_label="1 minute",
+                        price_str=price_str,
+                    )
 
         except Exception as exc:
             err = str(exc)
@@ -938,8 +983,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"\U0001f44b Welcome, {name}!\n\n"
         "\U0001f4e1 OTC Signal Bot\n"
-        f"Connection: {conn_str}\n\n"
-        "Tap a button below, or use these commands:\n"
+        f"Connection: {conn_str}\n"
+        f"Account: {us.name}\n"
+    )
+    if len(us.all_broadcast_ids()) > 1:
+        text += f"Team broadcast: {len(us.all_broadcast_ids())} recipients\n"
+    text += (
+        "\nTap a button below, or use these commands:\n"
         "/signal \u2014 latest signal\n"
         "/stats \u2014 your win/loss statistics\n"
         "/autoon \u2014 enable auto-signals\n"
@@ -1513,13 +1563,18 @@ async def reset_and_set_webhook() -> None:
 # ---------------------------------------------------------------------------
 
 async def health(request: Request) -> JSONResponse:
+    # Only show primary users (not broadcast aliases) to avoid duplicates
+    primary_users = {
+        cid: us for cid, us in user_registry.items() if us.chat_id == cid
+    }
     users_status = {
         str(cid): {
-            "name":      us.name,
-            "connected": us.session_manager is not None and us.session_manager.is_connected,
-            "last_signal": us.latest_signal,
+            "name":          us.name,
+            "connected":     us.session_manager is not None and us.session_manager.is_connected,
+            "broadcast_ids": us.all_broadcast_ids(),
+            "last_signal":   us.latest_signal,
         }
-        for cid, us in user_registry.items()
+        for cid, us in primary_users.items()
     }
     return JSONResponse({
         "status":    "healthy",
@@ -1563,6 +1618,7 @@ async def lifespan(app: Starlette):
             chat_id=cfg["chat_id"],
             ssid=cfg["ssid"],
             is_demo=cfg["is_demo"],
+            broadcast_ids=cfg.get("broadcast_ids", []),
         )
         us.session_manager = SessionManager(
             ssid=cfg["ssid"],
@@ -1579,8 +1635,17 @@ async def lifespan(app: Starlette):
         us.poll_task = asyncio.create_task(
             _user_poll_loop(us), name=f"poll_{us.chat_id}"
         )
+
+        # Register primary chat_id
         user_registry[us.chat_id] = us
         logger.info(f"Registered user: {us.name} (chat_id={us.chat_id})")
+
+        # Also register broadcast IDs so they can use commands (/start, /signal, etc.)
+        # They share the same UserSession (same SSID, same connection)
+        for extra_id in us.broadcast_ids:
+            if extra_id != us.chat_id:
+                user_registry[extra_id] = us
+                logger.info(f"  Registered broadcast recipient {extra_id} → [{us.name}]")
 
     yield  # ── server is running ──────────────────────────────────────────
 
