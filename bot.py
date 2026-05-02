@@ -98,75 +98,85 @@ async def pocket_option_loop():
     """
     Connects to Pocket Option, then polls for candle data every 60 seconds.
     Updates latest_signal on each tick and broadcasts CALL/PUT to Telegram.
+    Retries connection every 5 minutes if it fails (e.g. expired SSID).
     """
-    global latest_signal
+    global latest_signal, po_client
 
-    logger.info(f"Pocket Option loop starting... po_client={po_client}")
+    logger.info("Pocket Option loop starting...")
 
-    # po_client is already initialized in lifespan
-    if not po_client:
-        error_msg = "po_client is None — cannot start loop"
-        logger.error(error_msg)
-        log_error(error_msg)
-        return
+    CONNECT_RETRY_INTERVAL = 300  # retry connection every 5 minutes
 
-    try:
-        logger.info("Calling po_client.connect()...")
-        logger.info(f"SSID being used: {SSID[:30]}..." if len(SSID) > 30 else f"SSID: {SSID}")
-        
-        connected = await po_client.connect()
-        
-        logger.info(f"po_client.connect() returned: {connected}")
-        logger.info(f"po_client.is_connected property: {po_client.is_connected}")
-        logger.info(f"po_client attributes: {dir(po_client)}")
-        
-        if not connected:
-            error_msg = "connect() returned False - check SSID format"
-            logger.error(f"Pocket Option: {error_msg}")
-            log_error(error_msg)
-            # Try to get more info about the client state
-            try:
-                logger.error(f"Client state: {po_client.__dict__}")
-            except:
-                pass
-            return
-        
-        logger.info("Pocket Option: connected successfully.")
-    except Exception as e:
-        error_msg = f"Connect error: {str(e)}"
-        logger.error(f"Pocket Option {error_msg}", exc_info=True)
-        log_error(error_msg)
-        return
-
-    # Connection loop with retry logic
     while True:
-        try:
-            # Check if still connected before fetching candles
-            if not po_client.is_connected:
-                error_msg = "Lost connection, attempting reconnect"
-                logger.warning(error_msg)
+        # ── (Re)initialize client if needed ──────────────────────────────
+        if po_client is None:
+            try:
+                po_client = AsyncPocketOptionClient(ssid=SSID, is_demo=True)
+                logger.info("PO client (re)initialized.")
+            except Exception as e:
+                error_msg = f"Client init error: {e}"
+                logger.error(error_msg, exc_info=True)
                 log_error(error_msg)
-                try:
-                    await po_client.connect()
-                except Exception as e:
-                    error_msg = f"Reconnect failed: {str(e)}"
+                await asyncio.sleep(CONNECT_RETRY_INTERVAL)
+                continue
+
+        # ── Connect ───────────────────────────────────────────────────────
+        if not po_client.is_connected:
+            try:
+                logger.info("Calling po_client.connect()...")
+                connected = await po_client.connect()
+                logger.info(f"connect() returned: {connected}, is_connected: {po_client.is_connected}")
+
+                if not connected:
+                    error_msg = (
+                        "connect() returned False — SSID is likely expired or invalid. "
+                        "Go to pocketoption.com > DevTools > Network > WS, copy the full "
+                        '42["auth",{...}] message and update the SSID env var on Render.'
+                    )
                     logger.error(error_msg)
-                    log_error(error_msg)
-                    await asyncio.sleep(10)
+                    log_error("SSID expired/invalid — update SSID on Render")
+                    # Notify via Telegram if possible
+                    if CHAT_ID:
+                        try:
+                            await telegram_app.bot.send_message(
+                                chat_id=CHAT_ID,
+                                text=(
+                                    "⚠️ Pocket Option connection failed.\n\n"
+                                    "Your SSID is likely expired.\n\n"
+                                    "To fix:\n"
+                                    "1. Open pocketoption.com in browser\n"
+                                    "2. Press F12 → Network tab → filter WS\n"
+                                    "3. Find message starting with 42[\"auth\",\n"
+                                    "4. Copy the full message\n"
+                                    "5. Update SSID on Render dashboard\n"
+                                    "6. Redeploy the service"
+                                )
+                            )
+                        except Exception:
+                            pass
+                    await asyncio.sleep(CONNECT_RETRY_INTERVAL)
                     continue
-            
+
+                logger.info("Pocket Option: connected successfully.")
+
+            except Exception as e:
+                error_msg = f"Connect exception: {e}"
+                logger.error(error_msg, exc_info=True)
+                log_error(error_msg)
+                await asyncio.sleep(CONNECT_RETRY_INTERVAL)
+                continue
+
+        # ── Poll candles ──────────────────────────────────────────────────
+        try:
             logger.info(f"Fetching candles for {TRADE_ASSET}...")
             candles = await po_client.get_candles(
                 asset=TRADE_ASSET,
                 timeframe=CANDLE_PERIOD,
                 count=CANDLE_COUNT,
             )
-            
             logger.info(f"Received {len(candles) if candles else 0} candles")
 
             direction, reason = compute_signal(candles)
 
-            # Get latest price from most recent Candle object
             price = None
             if candles:
                 try:
@@ -197,13 +207,13 @@ async def pocket_option_loop():
                     await telegram_app.bot.send_message(
                         chat_id=CHAT_ID, text=message, parse_mode='Markdown'
                     )
-                    logger.info(f"Broadcast signal to Telegram: {direction}")
+                    logger.info(f"Broadcast signal: {direction}")
                 except Exception as e:
                     logger.error(f"Telegram send error: {e}")
 
         except Exception as e:
-            error_msg = f"Loop error: {str(e)}"
-            logger.error(f"Pocket Option {error_msg}", exc_info=True)
+            error_msg = f"Candle fetch error: {e}"
+            logger.error(error_msg, exc_info=True)
             log_error(error_msg)
 
         await asyncio.sleep(CANDLE_PERIOD)
@@ -364,15 +374,15 @@ async def lifespan(app: Starlette):
     await telegram_app.start()
     await reset_and_set_webhook()
 
-    # Initialize PO client BEFORE starting the background loop
+    # Initialize PO client before starting the background loop
     try:
         po_client = AsyncPocketOptionClient(ssid=SSID, is_demo=True)
-        logger.info(f"Pocket Option client initialized. Client object: {po_client}")
+        logger.info(f"Pocket Option client initialized.")
     except Exception as e:
         logger.error(f"Failed to initialize PO client: {e}")
         po_client = None
 
-    # Start Pocket Option background loop
+    # Start Pocket Option background loop (handles connect + retry internally)
     po_task = asyncio.create_task(pocket_option_loop())
     logger.info("Pocket Option background task created.")
 
