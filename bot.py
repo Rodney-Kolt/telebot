@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 import logging
+import math
 import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -10,8 +11,11 @@ from starlette.routing import Route
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 import uvicorn
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes,
+)
 from pocketoptionapi_async import AsyncPocketOptionClient
 
 # ---------------------------------------------------------------------------
@@ -43,8 +47,43 @@ if not SSID:
 PO_DEMO = int(os.environ.get("PO_DEMO", "1"))  # 1 = demo, 0 = real
 
 TRADE_ASSET  = "EURUSD_otc"
-CANDLE_PERIOD = 60   # seconds
-CANDLE_COUNT  = 10   # candles to fetch per poll
+CANDLE_PERIOD = 60   # seconds for the auto-signal loop
+CANDLE_COUNT  = 50   # candles to fetch (enough for RSI-14 + EMA-20)
+
+# ---------------------------------------------------------------------------
+# Asset catalogue
+# ---------------------------------------------------------------------------
+# Maps display label → Pocket Option asset code
+ASSETS: dict[str, str] = {
+    "EUR/USD (OTC)": "EURUSD_otc",
+    "AUD/USD (OTC)": "AUDUSD_otc",
+    "USD/JPY (OTC)": "USDJPY_otc",
+    "GBP/USD (OTC)": "GBPUSD_otc",
+    "USD/CAD (OTC)": "USDCAD_otc",
+    "EUR/JPY (OTC)": "EURJPY_otc",
+}
+
+# Maps display label → candle timeframe in seconds
+TIMEFRAMES: dict[str, int] = {
+    "5 seconds":  5,
+    "1 minute":   60,
+    "2 minutes":  120,
+    "5 minutes":  300,
+}
+
+# ConversationHandler states
+CHOOSE_ASSET, CHOOSE_TIME = range(2)
+
+# ---------------------------------------------------------------------------
+# Per-user settings  {user_id: {"asset": label, "timeframe": label, "auto": bool}}
+# ---------------------------------------------------------------------------
+user_settings: dict[int, dict] = {}
+
+DEFAULT_SETTINGS = {
+    "asset":     "EUR/USD (OTC)",
+    "timeframe": "1 minute",
+    "auto":      True,          # receive auto-broadcast signals
+}
 
 # ---------------------------------------------------------------------------
 # Global signal state
@@ -293,21 +332,201 @@ async def _telegram_notify(text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Signal logic — 3-candle momentum
+# Technical analysis helpers (pure Python, no extra libraries)
 # ---------------------------------------------------------------------------
+
+def _closes(candles: list) -> list[float]:
+    return [float(c.close) for c in candles]
+
+
+def _ema(values: list[float], period: int) -> list[float]:
+    """Exponential moving average."""
+    if len(values) < period:
+        return []
+    k = 2 / (period + 1)
+    ema = [sum(values[:period]) / period]
+    for v in values[period:]:
+        ema.append(v * k + ema[-1] * (1 - k))
+    return ema
+
+
+def _rsi(values: list[float], period: int = 14) -> float | None:
+    """Wilder RSI. Returns the most recent RSI value or None."""
+    if len(values) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(1, len(values)):
+        d = values[i] - values[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    # Wilder smoothing
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _market_condition(candles: list) -> str:
+    """Classify market as Trending, Ranging, or Volatile."""
+    if len(candles) < 10:
+        return "Unknown"
+    closes = _closes(candles[-20:])
+    highs  = [float(c.high) for c in candles[-20:]] if hasattr(candles[-1], "high") else closes
+    lows   = [float(c.low)  for c in candles[-20:]] if hasattr(candles[-1], "low")  else closes
+    atr    = sum(h - l for h, l in zip(highs, lows)) / len(highs)
+    price  = closes[-1]
+    atr_pct = (atr / price) * 100 if price else 0
+
+    ema_fast = _ema(closes, 5)
+    ema_slow = _ema(closes, 20)
+    if ema_fast and ema_slow:
+        trend_strength = abs(ema_fast[-1] - ema_slow[-1]) / price * 100 if price else 0
+        if trend_strength > 0.05:
+            return "Trending"
+    if atr_pct > 0.1:
+        return "Volatile"
+    return "Ranging"
+
+
+def compute_signal_advanced(
+    candles: list,
+    timeframe_seconds: int = 60,
+) -> dict:
+    """
+    Returns a dict with keys:
+      direction   – "HIGHER" | "LOWER" | "WAIT"
+      confidence  – int 0-100
+      rsi         – float | None
+      reason      – str
+      market      – str
+    """
+    result = {
+        "direction":  "WAIT",
+        "confidence": 0,
+        "rsi":        None,
+        "reason":     "Not enough data",
+        "market":     "Unknown",
+    }
+
+    if not candles or len(candles) < 20:
+        return result
+
+    closes = _closes(candles)
+    rsi    = _rsi(closes, 14)
+    ema9   = _ema(closes, 9)
+    ema21  = _ema(closes, 21)
+    market = _market_condition(candles)
+
+    result["rsi"]    = rsi
+    result["market"] = market
+
+    if rsi is None or not ema9 or not ema21:
+        result["reason"] = "Insufficient data for indicators"
+        return result
+
+    price     = closes[-1]
+    ema9_val  = ema9[-1]
+    ema21_val = ema21[-1]
+
+    # ── Direction logic ──────────────────────────────────────────────────
+    bullish_signals = 0
+    bearish_signals = 0
+
+    # RSI
+    if rsi < 35:
+        bullish_signals += 2   # oversold → likely bounce up
+    elif rsi < 45:
+        bullish_signals += 1
+    elif rsi > 65:
+        bearish_signals += 2   # overbought → likely drop
+    elif rsi > 55:
+        bearish_signals += 1
+
+    # EMA crossover
+    if ema9_val > ema21_val:
+        bullish_signals += 2
+    elif ema9_val < ema21_val:
+        bearish_signals += 2
+
+    # Price vs EMA9
+    if price > ema9_val:
+        bullish_signals += 1
+    else:
+        bearish_signals += 1
+
+    # 3-candle momentum (existing logic)
+    if len(closes) >= 4:
+        c = closes[-4:]
+        if c[-1] > c[-2] > c[-3] > c[-4]:
+            bullish_signals += 1
+        elif c[-1] < c[-2] < c[-3] < c[-4]:
+            bearish_signals += 1
+
+    total = bullish_signals + bearish_signals
+    if total == 0:
+        return result
+
+    if bullish_signals > bearish_signals:
+        direction = "HIGHER"
+        raw_conf  = bullish_signals / total
+    elif bearish_signals > bullish_signals:
+        direction = "LOWER"
+        raw_conf  = bearish_signals / total
+    else:
+        result["direction"] = "WAIT"
+        result["reason"]    = "Mixed signals — no clear edge"
+        result["confidence"] = 50
+        return result
+
+    # ── Confidence score ─────────────────────────────────────────────────
+    # Base: signal ratio (50–80%)
+    base_conf = 50 + raw_conf * 30
+
+    # RSI extremity bonus (up to +15%)
+    if direction == "HIGHER" and rsi is not None:
+        rsi_bonus = max(0, (40 - rsi) / 40) * 15   # RSI=0 → +15, RSI=40 → 0
+    elif direction == "LOWER" and rsi is not None:
+        rsi_bonus = max(0, (rsi - 60) / 40) * 15   # RSI=100 → +15, RSI=60 → 0
+    else:
+        rsi_bonus = 0
+
+    # Timeframe penalty: very short timeframes are noisier
+    tf_penalty = 0
+    if timeframe_seconds <= 5:
+        tf_penalty = 8
+    elif timeframe_seconds <= 15:
+        tf_penalty = 4
+
+    confidence = min(97, max(51, int(base_conf + rsi_bonus - tf_penalty)))
+
+    # ── Reason string ────────────────────────────────────────────────────
+    ema_desc = "EMA9 > EMA21" if ema9_val > ema21_val else "EMA9 < EMA21"
+    reason = (
+        f"RSI={rsi:.1f}, {ema_desc}, "
+        f"{'bullish' if direction == 'HIGHER' else 'bearish'} momentum"
+    )
+
+    result.update({
+        "direction":  direction,
+        "confidence": confidence,
+        "reason":     reason,
+    })
+    return result
+
+
+# Legacy wrapper used by the auto-broadcast loop
 def compute_signal(candles: list) -> tuple[str, str]:
-    if not candles or len(candles) < 4:
-        return "WAIT ⏸", "Not enough candle data yet"
-    try:
-        closes = [float(c.close) for c in candles[-4:]]
-        if closes[-1] > closes[-2] > closes[-3] > closes[-4]:
-            return "CALL ✅", "3 consecutive rising closes (bullish momentum)"
-        if closes[-1] < closes[-2] < closes[-3] < closes[-4]:
-            return "PUT ❌", "3 consecutive falling closes (bearish momentum)"
-        return "WAIT ⏸", "No clear momentum"
-    except Exception as exc:
-        logger.warning(f"compute_signal error: {exc}")
-        return "WAIT ⏸", f"Signal error: {exc}"
+    r = compute_signal_advanced(candles)
+    if r["direction"] == "HIGHER":
+        return "CALL ✅", r["reason"]
+    if r["direction"] == "LOWER":
+        return "PUT ❌", r["reason"]
+    return "WAIT ⏸", r["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -389,41 +608,283 @@ async def pocket_option_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Telegram command handlers
+# Per-user helpers
+# ---------------------------------------------------------------------------
+
+def _get_settings(user_id: int) -> dict:
+    if user_id not in user_settings:
+        user_settings[user_id] = dict(DEFAULT_SETTINGS)
+    return user_settings[user_id]
+
+
+# ---------------------------------------------------------------------------
+# Keyboard builders
+# ---------------------------------------------------------------------------
+
+def _main_menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    settings = _get_settings(user_id)
+    auto_label = "\U0001f514 Auto-signals: ON" if settings["auto"] else "\U0001f515 Auto-signals: OFF"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f4ca Get Signal",   callback_data="menu:signal")],
+        [InlineKeyboardButton("\u2139\ufe0f How it works", callback_data="menu:howto")],
+        [InlineKeyboardButton("\u2699\ufe0f Settings",   callback_data="menu:settings")],
+        [InlineKeyboardButton(auto_label,               callback_data="menu:toggle_auto")],
+    ])
+
+
+def _asset_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    items = list(ASSETS.keys())
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(items[i], callback_data=f"asset:{items[i]}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(items[i + 1], callback_data=f"asset:{items[i + 1]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _timeframe_keyboard() -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(label, callback_data=f"tf:{label}")]
+            for label in TIMEFRAMES]
+    rows.append([InlineKeyboardButton("\U0001f519 Back", callback_data="asset:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _settings_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    s = _get_settings(user_id)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Asset: {s['asset']}",         callback_data="settings:asset")],
+        [InlineKeyboardButton(f"Timeframe: {s['timeframe']}", callback_data="settings:tf")],
+        [InlineKeyboardButton("\U0001f519 Back",              callback_data="menu:back")],
+    ])
+
+
+# ---------------------------------------------------------------------------
+# /start  — main menu
 # ---------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "🤖 Real-time Signal Bot is running!\n\n"
-        "Commands:\n"
-        "/signal  — current signal\n"
-        "/status  — connection status\n"
-        "/debug   — diagnostics\n"
-        "/logs    — recent errors\n"
-        "/reconnect — force reconnect"
-    )
-
-
-async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    sig = latest_signal
+    user  = update.effective_user
+    uid   = user.id
+    name  = user.first_name or "Trader"
     po_ok = session_manager is not None and session_manager.is_connected
-    if sig["direction"] is None:
-        await update.message.reply_text(
-            f"No signal yet.\n"
-            f"PO connected: {'yes' if po_ok else 'no'}\n"
-            f"Waiting for first candle poll (up to 60s after startup).\n"
-            f"Use /debug or /logs if this persists."
+    conn_str = "\U0001f7e2 Live" if po_ok else "\U0001f534 Offline"
+    text  = (
+        f"\U0001f44b Welcome, {name}!\n\n"
+        "\U0001f4e1 OTC Signal Bot\n"
+        f"Connection: {conn_str}\n\n"
+        "Choose an option below:"
+    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=_main_menu_keyboard(uid))
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=_main_menu_keyboard(uid))
+
+
+# ---------------------------------------------------------------------------
+# Inline button router  (ConversationHandler states: CHOOSE_ASSET, CHOOSE_TIME)
+# ---------------------------------------------------------------------------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query    = update.callback_query
+    await query.answer()
+    data     = query.data
+    user_id  = query.from_user.id
+    settings = _get_settings(user_id)
+
+    # ── Main menu ────────────────────────────────────────────────────────
+    if data == "menu:back":
+        await start(update, context)
+        return ConversationHandler.END
+
+    if data == "menu:signal":
+        await query.edit_message_text(
+            "\U0001f4ca Select an asset:",
+            reply_markup=_asset_keyboard(),
         )
-        return
-    price_str = f"{sig['price']:.5f}" if sig["price"] else "N/A"
-    await update.message.reply_text(
-        f"Current Signal\n"
-        f"Asset: EURUSD OTC\n"
-        f"Direction: {sig['direction']}\n"
-        f"Price: {price_str}\n"
-        f"Reason: {sig['reason']}\n"
-        f"Updated: {sig['timestamp']}"
+        return CHOOSE_ASSET
+
+    if data == "menu:howto":
+        await query.edit_message_text(
+            "\u2139\ufe0f How the bot works\n\n"
+            "The bot connects to Pocket Option via WebSocket and fetches "
+            "real-time OHLC candle data for the selected asset.\n\n"
+            "Signals are generated using:\n"
+            "\u2022 RSI (14) \u2014 identifies overbought/oversold conditions\n"
+            "\u2022 EMA (9) & EMA (21) \u2014 trend direction via crossover\n"
+            "\u2022 3-candle momentum \u2014 confirms short-term price direction\n\n"
+            "Confidence % reflects how strongly the indicators agree.\n"
+            "Higher RSI extremity + EMA alignment = higher confidence.\n\n"
+            "\u26a0\ufe0f Signals are for informational purposes only.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:settings":
+        await query.edit_message_text(
+            "\u2699\ufe0f Settings\n\nYour current defaults:",
+            reply_markup=_settings_keyboard(user_id),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:toggle_auto":
+        settings["auto"] = not settings["auto"]
+        state = "ON \u2705" if settings["auto"] else "OFF \U0001f515"
+        await query.edit_message_text(
+            f"Auto-signals turned {state}\n\n"
+            f"You will {'now' if settings['auto'] else 'no longer'} receive "
+            f"automatic signals every {CANDLE_PERIOD // 60} minute(s).",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    # ── Settings sub-menu ────────────────────────────────────────────────
+    if data == "settings:asset":
+        context.user_data["settings_mode"] = "asset"
+        await query.edit_message_text(
+            "\u2699\ufe0f Choose your default asset:",
+            reply_markup=_asset_keyboard(),
+        )
+        return CHOOSE_ASSET
+
+    if data == "settings:tf":
+        context.user_data["settings_mode"] = "tf"
+        await query.edit_message_text(
+            "\u2699\ufe0f Choose your default timeframe:",
+            reply_markup=_timeframe_keyboard(),
+        )
+        return CHOOSE_TIME
+
+    # ── Asset selection ──────────────────────────────────────────────────
+    if data.startswith("asset:"):
+        asset_label = data[len("asset:"):]
+
+        if asset_label == "back":
+            await start(update, context)
+            return ConversationHandler.END
+
+        context.user_data["chosen_asset"] = asset_label
+
+        if context.user_data.get("settings_mode") == "asset":
+            settings["asset"] = asset_label
+            context.user_data.pop("settings_mode", None)
+            await query.edit_message_text(
+                f"\u2705 Default asset set to: {asset_label}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+                ]),
+            )
+            return ConversationHandler.END
+
+        await query.edit_message_text(
+            f"Asset: {asset_label}\n\nNow select a trading time:",
+            reply_markup=_timeframe_keyboard(),
+        )
+        return CHOOSE_TIME
+
+    # ── Timeframe selection → fetch & display signal ─────────────────────
+    if data.startswith("tf:"):
+        tf_label = data[len("tf:"):]
+
+        if context.user_data.get("settings_mode") == "tf":
+            settings["timeframe"] = tf_label
+            context.user_data.pop("settings_mode", None)
+            await query.edit_message_text(
+                f"\u2705 Default timeframe set to: {tf_label}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+                ]),
+            )
+            return ConversationHandler.END
+
+        asset_label = context.user_data.get("chosen_asset", settings["asset"])
+        tf_seconds  = TIMEFRAMES.get(tf_label, 60)
+        asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
+
+        await query.edit_message_text(
+            f"\u23f3 Fetching signal for {asset_label} / {tf_label}..."
+        )
+
+        result = await _fetch_signal(asset_code, tf_seconds)
+        text   = _format_signal(result, asset_label, tf_label)
+
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f504 New Signal", callback_data=f"tf:{tf_label}")],
+                [InlineKeyboardButton("\U0001f4ca Change Asset", callback_data="menu:signal")],
+                [InlineKeyboardButton("\U0001f3e0 Main Menu",   callback_data="menu:back")],
+            ]),
+        )
+        context.user_data["chosen_asset"] = asset_label
+        return ConversationHandler.END
+
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Signal fetching & formatting
+# ---------------------------------------------------------------------------
+
+async def _fetch_signal(asset_code: str, tf_seconds: int) -> dict:
+    if not (session_manager and session_manager.is_connected):
+        return {
+            "direction": "WAIT", "confidence": 0,
+            "rsi": None, "reason": "Not connected to Pocket Option",
+            "market": "Unknown",
+        }
+    try:
+        candles = await session_manager.get_candles(
+            asset=asset_code,
+            timeframe=tf_seconds,
+            count=CANDLE_COUNT,
+        )
+        return compute_signal_advanced(candles, tf_seconds)
+    except Exception as exc:
+        log_error(f"_fetch_signal error: {exc}")
+        return {
+            "direction": "WAIT", "confidence": 0,
+            "rsi": None, "reason": f"Error: {exc}",
+            "market": "Unknown",
+        }
+
+
+def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
+    direction  = result["direction"]
+    confidence = result["confidence"]
+    rsi        = result["rsi"]
+    reason     = result["reason"]
+    market     = result["market"]
+
+    if direction == "HIGHER":
+        dir_line = "Signal: HIGHER \u2705"
+    elif direction == "LOWER":
+        dir_line = "Signal: LOWER \U0001f534"
+    else:
+        dir_line = "Signal: WAIT \u23f8"
+
+    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+    filled  = round(confidence / 20)
+    bar     = "\u2588" * filled + "\u2591" * (5 - filled)
+
+    return (
+        f"{dir_line}\n"
+        f"Asset: {asset_label}\n"
+        f"Timeframe: {tf_label}\n"
+        f"Reliability: {confidence}%  {bar}\n"
+        f"RSI: {rsi_str}\n"
+        f"Market: {market}\n"
+        f"Reason: {reason}\n"
+        f"Time: {__import__('datetime').datetime.now().strftime('%H:%M:%S')}"
     )
 
+
+# ---------------------------------------------------------------------------
+# Remaining command handlers
+# ---------------------------------------------------------------------------
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     po_ok = session_manager is not None and session_manager.is_connected
@@ -437,23 +898,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"Server time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"PO connected: {'yes' if po_ok else 'no'}\n"
         f"Connected since: {connected_since}\n"
-        f"Last signal: {sig['direction'] or 'none'} @ {sig['timestamp'] or 'never'}"
+        f"Last auto-signal: {sig['direction'] or 'none'} @ {sig['timestamp'] or 'never'}"
     )
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     po_ok = session_manager is not None and session_manager.is_connected
     ssid_preview = f"{SSID[:25]}...{SSID[-8:]}" if len(SSID) > 33 else SSID
-
-    # Next scheduled refresh time
     refresh_in = "unknown"
     if session_manager and session_manager.connected_at:
         next_refresh = session_manager.connected_at + timedelta(hours=PREEMPTIVE_REFRESH_HOURS)
         delta = next_refresh - datetime.now()
-        h, rem = divmod(int(delta.total_seconds()), 3600)
+        h, rem = divmod(int(max(delta.total_seconds(), 0)), 3600)
         m = rem // 60
         refresh_in = f"{h}h {m}m" if delta.total_seconds() > 0 else "imminent"
-
     await update.message.reply_text(
         f"Debug Info\n"
         f"IS_RENDER: {IS_RENDER}\n"
@@ -463,7 +921,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"PO connected: {'yes' if po_ok else 'no'}\n"
         f"Next pre-emptive refresh: {refresh_in}\n"
         f"Ping interval: {PING_INTERVAL_SECONDS}s\n"
-        f"Signal: {latest_signal['direction'] or 'none'}\n"
+        f"Last auto-signal: {latest_signal['direction'] or 'none'}\n"
         f"Last update: {latest_signal['timestamp'] or 'never'}"
     )
 
@@ -476,7 +934,6 @@ async def logs_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def reconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force an immediate reconnect (useful after manually updating SSID on Render)."""
     await update.message.reply_text("Forcing reconnect to Pocket Option...")
     if session_manager:
         async with session_manager._lock:
@@ -492,12 +949,27 @@ async def reconnect_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Session manager not initialised yet.")
 
 
-telegram_app.add_handler(CommandHandler("start",      start))
-telegram_app.add_handler(CommandHandler("signal",     signal_command))
-telegram_app.add_handler(CommandHandler("status",     status_command))
-telegram_app.add_handler(CommandHandler("debug",      debug_command))
-telegram_app.add_handler(CommandHandler("logs",       logs_command))
-telegram_app.add_handler(CommandHandler("reconnect",  reconnect_command))
+# ---------------------------------------------------------------------------
+# Register handlers
+# ---------------------------------------------------------------------------
+conv_handler = ConversationHandler(
+    entry_points=[
+        CommandHandler("start", start),
+        CallbackQueryHandler(button_handler),
+    ],
+    states={
+        CHOOSE_ASSET: [CallbackQueryHandler(button_handler)],
+        CHOOSE_TIME:  [CallbackQueryHandler(button_handler)],
+    },
+    fallbacks=[CommandHandler("start", start)],
+    per_message=False,
+)
+
+telegram_app.add_handler(conv_handler)
+telegram_app.add_handler(CommandHandler("status",    status_command))
+telegram_app.add_handler(CommandHandler("debug",     debug_command))
+telegram_app.add_handler(CommandHandler("logs",      logs_command))
+telegram_app.add_handler(CommandHandler("reconnect", reconnect_command))
 
 
 # ---------------------------------------------------------------------------
