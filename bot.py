@@ -54,7 +54,7 @@ latest_signal: dict = {
 }
 
 # Module-level PocketOption client (created once, reused)
-po_client: PocketOption | None = None
+po_client: "AsyncPocketOptionClient | None" = None
 
 
 # ---------------------------------------------------------------------------
@@ -88,12 +88,14 @@ async def pocket_option_loop():
     Connects to Pocket Option, then polls for candle data every 60 seconds.
     Updates latest_signal on each tick and broadcasts CALL/PUT to Telegram.
     """
-    global po_client, latest_signal
+    global latest_signal
 
     logger.info("Pocket Option loop starting...")
 
-    # isDemo=1 for demo account (matches your SSID)
-    po_client = AsyncPocketOptionClient(ssid=SSID, is_demo=True)
+    # po_client is already initialized in lifespan
+    if not po_client:
+        logger.error("po_client is None — cannot start loop")
+        return
 
     try:
         connected = await po_client.connect()
@@ -275,11 +277,17 @@ routes = [
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: Starlette):
+    global po_client
+    
     logger.info("Starting up — webhook mode (Render)...")
 
     await telegram_app.initialize()
     await telegram_app.start()
     await reset_and_set_webhook()
+
+    # Initialize PO client BEFORE starting the background loop
+    po_client = AsyncPocketOptionClient(ssid=SSID, is_demo=True)
+    logger.info("Pocket Option client initialized.")
 
     # Start Pocket Option background loop
     po_task = asyncio.create_task(pocket_option_loop())
