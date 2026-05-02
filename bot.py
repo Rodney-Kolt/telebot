@@ -46,6 +46,10 @@ if not SSID:
 
 PO_DEMO = int(os.environ.get("PO_DEMO", "1"))  # 1 = demo, 0 = real
 
+# Signal photo URLs (set these as env vars on Render, or leave blank to use text-only)
+SIGNAL_IMG_BUY  = os.environ.get("SIGNAL_IMG_BUY",  "").strip()
+SIGNAL_IMG_SELL = os.environ.get("SIGNAL_IMG_SELL", "").strip()
+
 TRADE_ASSET  = "EURUSD_otc"
 CANDLE_PERIOD = 60   # seconds for the auto-signal loop
 CANDLE_COUNT  = 50   # candles to fetch (enough for RSI-14 + EMA-20)
@@ -84,6 +88,9 @@ DEFAULT_SETTINGS = {
     "timeframe": "1 minute",
     "auto":      True,          # receive auto-broadcast signals
 }
+
+# Registry of all users who have ever sent /start — used for auto-broadcasts
+known_users: set[int] = set()
 
 # ---------------------------------------------------------------------------
 # Global signal state
@@ -587,17 +594,29 @@ async def pocket_option_loop() -> None:
             }
             logger.info(f"Signal: {direction} | {reason} | price={price}")
 
-            # Broadcast actionable signals
-            if CHAT_ID and direction != "WAIT ⏸":
+            # Broadcast actionable signals to all opted-in users
+            if direction != "WAIT ⏸":
+                result = compute_signal_advanced(candles)
                 price_str = f"{price:.5f}" if price else "N/A"
-                await _telegram_notify(
-                    f"📡 Live Signal\n"
-                    f"Asset: EURUSD OTC\n"
-                    f"Direction: {direction}\n"
-                    f"Price: {price_str}\n"
-                    f"Reason: {reason}\n"
-                    f"Time: {datetime.now().strftime('%H:%M:%S')}"
-                )
+                # Build recipients: known_users who have auto ON, plus CHAT_ID fallback
+                recipients: set[int] = {
+                    uid for uid in known_users
+                    if _get_settings(uid).get("auto", True)
+                }
+                if CHAT_ID:
+                    try:
+                        recipients.add(int(CHAT_ID))
+                    except ValueError:
+                        pass
+
+                for chat_id in recipients:
+                    await _send_signal_message(
+                        chat_id=chat_id,
+                        result=result,
+                        asset_label="EUR/USD (OTC)",
+                        tf_label="1 minute",
+                        price_str=price_str,
+                    )
 
         except Exception as exc:
             err = str(exc)
@@ -670,12 +689,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name  = user.first_name or "Trader"
     po_ok = session_manager is not None and session_manager.is_connected
     conn_str = "\U0001f7e2 Live" if po_ok else "\U0001f534 Offline"
+
+    # Register user for auto-broadcasts
+    known_users.add(uid)
+
     text  = (
         f"\U0001f44b Welcome, {name}!\n\n"
         "\U0001f4e1 OTC Signal Bot\n"
         f"Connection: {conn_str}\n\n"
         "Tap a button below, or use these commands:\n"
         "/signal \u2014 latest auto-signal\n"
+        "/autoon \u2014 enable auto-signals\n"
+        "/autooff \u2014 disable auto-signals\n"
         "/status \u2014 connection status\n"
         "/getssid \u2014 show current SSID info\n"
         "/setssid <string> \u2014 update SSID without redeploying\n"
@@ -817,16 +842,35 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
         result = await _fetch_signal(asset_code, tf_seconds)
-        text   = _format_signal(result, asset_label, tf_label)
 
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001f504 New Signal", callback_data=f"tf:{tf_label}")],
-                [InlineKeyboardButton("\U0001f4ca Change Asset", callback_data="menu:signal")],
-                [InlineKeyboardButton("\U0001f3e0 Main Menu",   callback_data="menu:back")],
-            ]),
-        )
+        # For WAIT signals just show text in the existing message
+        if result["direction"] == "WAIT":
+            await query.edit_message_text(
+                _format_signal(result, asset_label, tf_label),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f504 Retry", callback_data=f"tf:{tf_label}")],
+                    [InlineKeyboardButton("\U0001f4ca Change Asset", callback_data="menu:signal")],
+                    [InlineKeyboardButton("\U0001f3e0 Main Menu",   callback_data="menu:back")],
+                ]),
+            )
+        else:
+            # Edit the "fetching..." message to show a nav keyboard
+            await query.edit_message_text(
+                _format_signal(result, asset_label, tf_label),
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f504 New Signal", callback_data=f"tf:{tf_label}")],
+                    [InlineKeyboardButton("\U0001f4ca Change Asset", callback_data="menu:signal")],
+                    [InlineKeyboardButton("\U0001f3e0 Main Menu",   callback_data="menu:back")],
+                ]),
+            )
+            # Also send the photo signal as a separate message
+            await _send_signal_message(
+                chat_id=query.message.chat_id,
+                result=result,
+                asset_label=asset_label,
+                tf_label=tf_label,
+            )
+
         context.user_data["chosen_asset"] = asset_label
         return ConversationHandler.END
 
@@ -861,6 +905,10 @@ async def _fetch_signal(asset_code: str, tf_seconds: int) -> dict:
 
 
 def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
+    """
+    Returns a plain-text signal message with large BUY/SELL header.
+    Used for inline menu display (edit_message_text).
+    """
     direction  = result["direction"]
     confidence = result["confidence"]
     rsi        = result["rsi"]
@@ -868,18 +916,18 @@ def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
     market     = result["market"]
 
     if direction == "HIGHER":
-        dir_line = "Signal: HIGHER \u2705"
+        header = "\U0001f4c8 BUY (CALL)"
     elif direction == "LOWER":
-        dir_line = "Signal: LOWER \U0001f534"
+        header = "\U0001f4c9 SELL (PUT)"
     else:
-        dir_line = "Signal: WAIT \u23f8"
+        header = "\u23f8 WAIT — no clear signal"
 
     rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
     filled  = round(confidence / 20)
     bar     = "\u2588" * filled + "\u2591" * (5 - filled)
 
     return (
-        f"{dir_line}\n"
+        f"{header}\n\n"
         f"Asset: {asset_label}\n"
         f"Timeframe: {tf_label}\n"
         f"Reliability: {confidence}%  {bar}\n"
@@ -890,9 +938,139 @@ def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
     )
 
 
+def _signal_caption(result: dict, asset_label: str, tf_label: str,
+                    price_str: str = "") -> str:
+    """
+    Caption for send_photo — same info as _format_signal but without
+    the large header (the image carries the visual direction cue).
+    """
+    direction  = result["direction"]
+    confidence = result["confidence"]
+    rsi        = result["rsi"]
+    reason     = result["reason"]
+    market     = result["market"]
+
+    action = "BUY" if direction == "HIGHER" else "SELL"
+    rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+    filled  = round(confidence / 20)
+    bar     = "\u2588" * filled + "\u2591" * (5 - filled)
+
+    lines = [
+        f"{action} Signal",
+        f"Asset: {asset_label}",
+        f"Timeframe: {tf_label}",
+    ]
+    if price_str:
+        lines.append(f"Price: {price_str}")
+    lines += [
+        f"Reliability: {confidence}%  {bar}",
+        f"RSI: {rsi_str}",
+        f"Market: {market}",
+        f"Reason: {reason}",
+        f"Time: {datetime.now().strftime('%H:%M:%S')}",
+    ]
+    return "\n".join(lines)
+
+
+async def _send_signal_message(
+    chat_id: int,
+    result: dict,
+    asset_label: str,
+    tf_label: str,
+    price_str: str = "",
+) -> None:
+    """
+    Send a signal to a single chat_id.
+    - HIGHER → send SIGNAL_IMG_BUY photo (fallback to text)
+    - LOWER  → send SIGNAL_IMG_SELL photo (fallback to text)
+    - WAIT   → send plain text (no photo)
+    """
+    direction = result["direction"]
+
+    if direction == "WAIT":
+        # Don't broadcast WAIT signals
+        return
+
+    img_url = SIGNAL_IMG_BUY if direction == "HIGHER" else SIGNAL_IMG_SELL
+    caption = _signal_caption(result, asset_label, tf_label, price_str)
+
+    if img_url:
+        try:
+            await telegram_app.bot.send_photo(
+                chat_id=chat_id,
+                photo=img_url,
+                caption=caption,
+            )
+            return
+        except Exception as exc:
+            logger.warning(f"send_photo failed for {chat_id}: {exc} — falling back to text")
+
+    # Fallback: plain text with the large header
+    text = _format_signal(result, asset_label, tf_label)
+    if price_str:
+        text += f"\nPrice: {price_str}"
+    try:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=text)
+    except Exception as exc:
+        logger.error(f"send_message fallback also failed for {chat_id}: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Remaining command handlers
 # ---------------------------------------------------------------------------
+
+async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually request the latest signal for the user's default asset/timeframe."""
+    uid      = update.effective_user.id
+    known_users.add(uid)
+    settings = _get_settings(uid)
+
+    asset_label = settings["asset"]
+    tf_label    = settings["timeframe"]
+    asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
+    tf_seconds  = TIMEFRAMES.get(tf_label, 60)
+
+    await update.message.reply_text(
+        f"\u23f3 Fetching signal for {asset_label} / {tf_label}..."
+    )
+
+    result = await _fetch_signal(asset_code, tf_seconds)
+
+    if result["direction"] == "WAIT":
+        await update.message.reply_text(_format_signal(result, asset_label, tf_label))
+    else:
+        await _send_signal_message(
+            chat_id=update.effective_chat.id,
+            result=result,
+            asset_label=asset_label,
+            tf_label=tf_label,
+        )
+
+
+async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable auto-signals for this user."""
+    uid = update.effective_user.id
+    known_users.add(uid)
+    _get_settings(uid)["auto"] = True
+    await update.message.reply_text(
+        "\U0001f514 Auto-signals enabled.\n"
+        f"You will receive signals every {CANDLE_PERIOD // 60} minute(s).\n\n"
+        "Use /autooff to disable, or toggle via the main menu."
+    )
+
+
+async def autooff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable auto-signals for this user."""
+    uid = update.effective_user.id
+    known_users.add(uid)
+    _get_settings(uid)["auto"] = False
+    await update.message.reply_text(
+        "\U0001f515 Auto-signals disabled.\n"
+        "You will no longer receive scheduled signals.\n\n"
+        "Use /autoon to re-enable, or tap the toggle in the main menu.\n"
+        "You can still request signals manually via /signal or the menu."
+    )
+
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     po_ok = session_manager is not None and session_manager.is_connected
@@ -1101,6 +1279,9 @@ conv_handler = ConversationHandler(
 )
 
 telegram_app.add_handler(conv_handler)
+telegram_app.add_handler(CommandHandler("signal",    signal_command))
+telegram_app.add_handler(CommandHandler("autoon",    autoon_command))
+telegram_app.add_handler(CommandHandler("autooff",   autooff_command))
 telegram_app.add_handler(CommandHandler("status",    status_command))
 telegram_app.add_handler(CommandHandler("debug",     debug_command))
 telegram_app.add_handler(CommandHandler("logs",      logs_command))
