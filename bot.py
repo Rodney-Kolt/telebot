@@ -46,9 +46,13 @@ if not SSID:
 
 PO_DEMO = int(os.environ.get("PO_DEMO", "1"))  # 1 = demo, 0 = real
 
-# Signal photo URLs (set these as env vars on Render, or leave blank to use text-only)
-SIGNAL_IMG_BUY  = os.environ.get("SIGNAL_IMG_BUY",  "").strip()
-SIGNAL_IMG_SELL = os.environ.get("SIGNAL_IMG_SELL", "").strip()
+# Signal photo URLs — override with env vars on Render, or use built-in defaults.
+# To use your own images: set SIGNAL_IMG_BUY and SIGNAL_IMG_SELL on Render dashboard.
+_DEFAULT_IMG_BUY  = "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3e/Green_arrow_up.svg/240px-Green_arrow_up.svg.png"
+_DEFAULT_IMG_SELL = "https://upload.wikimedia.org/wikipedia/commons/thumb/c/c0/Red_Arrow_Down.svg/240px-Red_Arrow_Down.svg.png"
+
+SIGNAL_IMG_BUY  = os.environ.get("SIGNAL_IMG_BUY",  "").strip() or _DEFAULT_IMG_BUY
+SIGNAL_IMG_SELL = os.environ.get("SIGNAL_IMG_SELL", "").strip() or _DEFAULT_IMG_SELL
 
 TRADE_ASSET  = "EURUSD_otc"
 CANDLE_PERIOD = 60   # seconds for the auto-signal loop
@@ -598,12 +602,17 @@ async def pocket_option_loop() -> None:
             if direction != "WAIT ⏸":
                 result = compute_signal_advanced(candles)
                 price_str = f"{price:.5f}" if price else "N/A"
-                # Build recipients: known_users who have auto ON, plus CHAT_ID fallback
+
+                # Build recipients: known_users who have auto ON
+                # CHAT_ID is only included if it belongs to a known user with auto ON,
+                # or if no users have started the bot yet (bootstrap fallback)
                 recipients: set[int] = {
                     uid for uid in known_users
                     if _get_settings(uid).get("auto", True)
                 }
-                if CHAT_ID:
+
+                # Bootstrap fallback: if nobody has /start-ed yet, still notify CHAT_ID
+                if not known_users and CHAT_ID:
                     try:
                         recipients.add(int(CHAT_ID))
                     except ValueError:
