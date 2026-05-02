@@ -213,19 +213,25 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    po_ok = po_client is not None and po_client.is_connected
-    ssid_preview = f"{SSID[:20]}...{SSID[-10:]}" if SSID and len(SSID) > 30 else str(SSID)
-    await update.message.reply_text(
-        f"🔧 *Debug Info*\n"
-        f"IS_RENDER: `{IS_RENDER}`\n"
-        f"RENDER_EXTERNAL_URL: `{RENDER_EXTERNAL_URL or 'not set'}`\n"
-        f"SSID set: `{'✅' if SSID else '❌'}`\n"
-        f"SSID preview: `{ssid_preview}`\n"
-        f"PO client connected: `{'✅' if po_ok else '❌'}`\n"
-        f"Signal: `{latest_signal['direction'] or 'none'}`\n"
-        f"Last update: `{latest_signal['timestamp'] or 'never'}`",
-        parse_mode='Markdown'
-    )
+    logger.info(f"Debug command called. po_client={po_client}")
+    try:
+        po_ok = po_client is not None and po_client.is_connected
+        ssid_preview = f"{SSID[:20]}...{SSID[-10:]}" if SSID and len(SSID) > 30 else str(SSID)
+        await update.message.reply_text(
+            f"🔧 *Debug Info*\n"
+            f"IS_RENDER: `{IS_RENDER}`\n"
+            f"RENDER_EXTERNAL_URL: `{RENDER_EXTERNAL_URL or 'not set'}`\n"
+            f"SSID set: `{'✅' if SSID else '❌'}`\n"
+            f"SSID preview: `{ssid_preview}`\n"
+            f"PO client connected: `{'✅' if po_ok else '❌'}`\n"
+            f"Signal: `{latest_signal['direction'] or 'none'}`\n"
+            f"Last update: `{latest_signal['timestamp'] or 'never'}`",
+            parse_mode='Markdown'
+        )
+        logger.info("Debug response sent")
+    except Exception as e:
+        logger.error(f"Debug command error: {e}", exc_info=True)
+        await update.message.reply_text(f"Debug error: {e}")
 
 
 telegram_app.add_handler(CommandHandler("start", start))
@@ -265,7 +271,11 @@ async def health(request: Request):
 async def telegram_webhook(request: Request):
     data = await request.json()
     logger.info(f"Received Telegram update: {data}")
-    await telegram_app.process_update(Update.de_json(data, telegram_app.bot))
+    try:
+        await telegram_app.process_update(Update.de_json(data, telegram_app.bot))
+        logger.info("Update processed successfully")
+    except Exception as e:
+        logger.error(f"Error processing update: {e}", exc_info=True)
     return JSONResponse({"status": "ok"})
 
 
