@@ -21,6 +21,7 @@ if not TOKEN:
 
 CHAT_ID = os.environ.get("CHAT_ID")
 SIGNAL_INTERVAL = int(os.environ.get("SIGNAL_INTERVAL", 300))
+RENDER_URL = os.environ.get("RENDER_URL", "").rstrip("/")
 
 telegram_app = Application.builder().token(TOKEN).build()
 
@@ -69,16 +70,37 @@ async def send_auto_signal():
 
 @asynccontextmanager
 async def lifespan(app):
-    # Startup: launch the background auto-signal task
+    # --- Startup ---
+    # Initialize the telegram app (sets up bot, dispatcher, etc.)
+    await telegram_app.initialize()
+    await telegram_app.start()
+
+    # Register the webhook with Telegram so it knows where to send updates
+    if RENDER_URL:
+        webhook_url = f"{RENDER_URL}/telegram"
+        await telegram_app.bot.set_webhook(webhook_url)
+        logger.info(f"Webhook set to: {webhook_url}")
+    else:
+        logger.warning("RENDER_URL not set — webhook not registered. Bot won't receive messages.")
+
+    # Launch the background auto-signal task
     task = asyncio.create_task(send_auto_signal())
     logger.info("Auto-signal background task started.")
+
     yield
-    # Shutdown: cancel the background task cleanly
+
+    # --- Shutdown ---
     task.cancel()
     try:
         await task
     except asyncio.CancelledError:
         logger.info("Auto-signal background task cancelled.")
+
+    # Remove the webhook and stop the telegram app cleanly
+    await telegram_app.bot.delete_webhook()
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+    logger.info("Telegram app shut down.")
 
 
 async def health(request: Request):
@@ -100,8 +122,11 @@ routes = [
 web_app = Starlette(routes=routes, lifespan=lifespan)
 
 if __name__ == "__main__":
+    # Local polling mode for development
     logger.info("Starting bot in polling mode...")
     telegram_app.run_polling()
 else:
+    # Production: uvicorn serves the Starlette app, webhook handles updates
     port = int(os.environ.get("PORT", 8000))
+    logger.info(f"Starting webhook server on port {port}...")
     uvicorn.run(web_app, host="0.0.0.0", port=port)
