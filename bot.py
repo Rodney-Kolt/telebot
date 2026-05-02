@@ -11,7 +11,7 @@ from starlette.responses import JSONResponse
 import uvicorn
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from pocketoptionapi_async import PocketOption
+from pocketoptionapi_async import AsyncPocketOptionClient
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -64,11 +64,12 @@ def compute_signal(candles: list) -> tuple[str, str]:
     """
     Returns (direction, reason).
     Needs at least 4 candles; uses the last 4 closing prices.
+    Candles are Candle objects with .close attribute.
     """
     if not candles or len(candles) < 4:
         return "WAIT ⏸", "Not enough candle data yet"
     try:
-        closes = [float(c["close"]) for c in candles[-4:]]
+        closes = [float(c.close) for c in candles[-4:]]
         if closes[-1] > closes[-2] > closes[-3] > closes[-4]:
             return "CALL ✅", "3 consecutive rising closes (bullish momentum)"
         if closes[-1] < closes[-2] < closes[-3] < closes[-4]:
@@ -92,7 +93,7 @@ async def pocket_option_loop():
     logger.info("Pocket Option loop starting...")
 
     # isDemo=1 for demo account (matches your SSID)
-    po_client = PocketOption(ssid=SSID, demo=True)
+    po_client = AsyncPocketOptionClient(ssid=SSID, is_demo=True)
 
     try:
         connected = await po_client.connect()
@@ -108,18 +109,18 @@ async def pocket_option_loop():
         try:
             candles = await po_client.get_candles(
                 asset=TRADE_ASSET,
-                period=CANDLE_PERIOD,
+                timeframe=CANDLE_PERIOD,
                 count=CANDLE_COUNT,
             )
 
             direction, reason = compute_signal(candles)
 
-            # Try to get latest price from most recent candle
+            # Get latest price from most recent Candle object
             price = None
             if candles:
                 try:
-                    price = float(candles[-1]["close"])
-                except (KeyError, TypeError, ValueError):
+                    price = float(candles[-1].close)
+                except (AttributeError, TypeError, ValueError):
                     pass
 
             latest_signal = {
@@ -174,10 +175,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sig = latest_signal
     if sig["direction"] is None:
-        po_ok = po_client is not None
+        po_ok = po_client is not None and po_client.is_connected
         await update.message.reply_text(
             f"⏳ No signal yet.\n\n"
-            f"PO client initialised: {'✅' if po_ok else '❌'}\n"
+            f"PO client connected: {'✅' if po_ok else '❌'}\n"
             f"Waiting for first candle poll (up to 60s after startup).\n"
             f"If this persists, use /debug to check connection."
         )
@@ -195,19 +196,19 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    po_ok = po_client is not None
+    po_ok = po_client is not None and po_client.is_connected
     sig = latest_signal
     await update.message.reply_text(
         f"✅ *Bot Status*\n"
         f"Server time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"PO client: {'🟢 Running' if po_ok else '🔴 Not started'}\n"
+        f"PO client: {'🟢 Connected' if po_ok else '🔴 Not connected'}\n"
         f"Last signal: {sig['direction'] or 'none'} @ {sig['timestamp'] or 'never'}",
         parse_mode='Markdown'
     )
 
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    po_ok = po_client is not None
+    po_ok = po_client is not None and po_client.is_connected
     ssid_preview = f"{SSID[:20]}...{SSID[-10:]}" if SSID and len(SSID) > 30 else str(SSID)
     await update.message.reply_text(
         f"🔧 *Debug Info*\n"
@@ -215,7 +216,7 @@ async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"RENDER_EXTERNAL_URL: `{RENDER_EXTERNAL_URL or 'not set'}`\n"
         f"SSID set: `{'✅' if SSID else '❌'}`\n"
         f"SSID preview: `{ssid_preview}`\n"
-        f"PO client: `{'initialised' if po_ok else 'None'}`\n"
+        f"PO client connected: `{'✅' if po_ok else '❌'}`\n"
         f"Signal: `{latest_signal['direction'] or 'none'}`\n"
         f"Last update: `{latest_signal['timestamp'] or 'never'}`",
         parse_mode='Markdown'
@@ -251,7 +252,7 @@ async def health(request: Request):
     return JSONResponse({
         "status": "healthy",
         "timestamp": str(datetime.now()),
-        "po_running": po_client is not None,
+        "po_connected": po_client is not None and po_client.is_connected,
         "latest_signal": latest_signal,
     })
 
@@ -295,8 +296,8 @@ async def lifespan(app: Starlette):
     if po_client:
         try:
             await po_client.disconnect()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Disconnect error: {e}")
 
     await telegram_app.stop()
     await telegram_app.shutdown()
