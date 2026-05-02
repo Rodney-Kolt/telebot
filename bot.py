@@ -1,4 +1,5 @@
 import os
+import csv
 import json
 import time
 import asyncio
@@ -290,6 +291,251 @@ def _vote_keyboard(signal_id: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("\U0001f44d Win",  callback_data=f"vote:win:{signal_id}"),
         InlineKeyboardButton("\U0001f44e Loss", callback_data=f"vote:loss:{signal_id}"),
     ]])
+
+
+# ---------------------------------------------------------------------------
+# Trade logging (CSV per user)
+# ---------------------------------------------------------------------------
+
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+_CSV_HEADERS = [
+    "timestamp", "asset", "direction", "result",
+    "confidence", "rsi", "price", "timeframe",
+    "market_condition", "reason",
+]
+
+USER_SETTINGS_FILE = os.path.join(_BASE_DIR, "user_settings.json")
+# Per-user persistent settings: {str(chat_id): {"restrict_to_best_window": bool,
+#                                                "best_window_start": int,
+#                                                "best_window_end": int}}
+user_persistent_settings: dict[str, dict] = {}
+
+
+def _load_user_persistent_settings() -> None:
+    global user_persistent_settings
+    try:
+        if os.path.exists(USER_SETTINGS_FILE):
+            with open(USER_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                user_persistent_settings = json.load(f)
+            logger.info(f"Loaded persistent settings for {len(user_persistent_settings)} users")
+    except Exception as exc:
+        logger.warning(f"Could not load user_settings.json: {exc}")
+
+
+def _save_user_persistent_settings() -> None:
+    try:
+        with open(USER_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(user_persistent_settings, f, indent=2)
+    except Exception as exc:
+        logger.warning(f"Could not save user_settings.json: {exc}")
+
+
+def _get_user_persistent(chat_id: int) -> dict:
+    key = str(chat_id)
+    if key not in user_persistent_settings:
+        user_persistent_settings[key] = {
+            "restrict_to_best_window": False,
+            "best_window_start": None,
+            "best_window_end":   None,
+        }
+    return user_persistent_settings[str(chat_id)]
+
+
+def _csv_path(chat_id: int) -> str:
+    return os.path.join(_BASE_DIR, f"trades_{chat_id}.csv")
+
+
+def _log_trade(chat_id: int, signal_meta: dict, result: str) -> None:
+    """Append one trade row to trades_<chat_id>.csv."""
+    path = _csv_path(chat_id)
+    write_header = not os.path.exists(path)
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_CSV_HEADERS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp":        datetime.utcnow().isoformat(timespec="seconds"),
+                "asset":            signal_meta.get("asset_label", "EUR/USD (OTC)"),
+                "direction":        signal_meta.get("direction", ""),
+                "result":           result,
+                "confidence":       signal_meta.get("confidence", ""),
+                "rsi":              signal_meta.get("rsi", ""),
+                "price":            signal_meta.get("price", ""),
+                "timeframe":        signal_meta.get("tf_label", "1 minute"),
+                "market_condition": signal_meta.get("market", ""),
+                "reason":           signal_meta.get("reason", ""),
+            })
+    except Exception as exc:
+        logger.warning(f"Could not write trade log for {chat_id}: {exc}")
+
+
+def _read_trades(chat_id: int) -> list[dict]:
+    """Return all rows from trades_<chat_id>.csv as list of dicts."""
+    path = _csv_path(chat_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception as exc:
+        logger.warning(f"Could not read trade log for {chat_id}: {exc}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Analytics helpers
+# ---------------------------------------------------------------------------
+
+def _win_rate(rows: list[dict]) -> float:
+    if not rows:
+        return 0.0
+    wins = sum(1 for r in rows if r.get("result") == "win")
+    return wins / len(rows) * 100
+
+
+def _group_win_rate(rows: list[dict], key_fn) -> dict[str, tuple[int, int]]:
+    """Returns {label: (wins, total)} grouped by key_fn(row)."""
+    groups: dict[str, list] = {}
+    for r in rows:
+        label = key_fn(r)
+        groups.setdefault(label, []).append(r)
+    return {
+        label: (sum(1 for r in g if r.get("result") == "win"), len(g))
+        for label, g in sorted(groups.items())
+    }
+
+
+def _hour_window(row: dict) -> str:
+    try:
+        hour = int(row["timestamp"][11:13])
+        start = (hour // 4) * 4
+        return f"{start:02d}-{start+4:02d} UTC"
+    except Exception:
+        return "Unknown"
+
+
+def _day_of_week(row: dict) -> str:
+    try:
+        from datetime import datetime as _dt
+        dt = _dt.fromisoformat(row["timestamp"])
+        return dt.strftime("%A")
+    except Exception:
+        return "Unknown"
+
+
+def _confidence_bin(row: dict) -> str:
+    try:
+        c = int(row["confidence"])
+        if c < 60:   return "50-59"
+        if c < 70:   return "60-69"
+        if c < 80:   return "70-79"
+        if c < 90:   return "80-89"
+        return "90-100"
+    except Exception:
+        return "Unknown"
+
+
+def _rsi_bin(row: dict) -> str:
+    try:
+        r = float(row["rsi"])
+        if r < 30:   return "<30"
+        if r < 40:   return "30-40"
+        if r < 60:   return "40-60"
+        if r < 70:   return "60-70"
+        return ">70"
+    except Exception:
+        return "Unknown"
+
+
+def _best_window(rows: list[dict]) -> tuple[str | None, float]:
+    """Return (window_label, win_rate%) for the best 4-hour UTC window."""
+    groups = _group_win_rate(rows, _hour_window)
+    best_label, best_wr = None, -1.0
+    for label, (wins, total) in groups.items():
+        if total >= 3:   # need at least 3 trades to be meaningful
+            wr = wins / total * 100
+            if wr > best_wr:
+                best_wr, best_label = wr, label
+    return best_label, best_wr
+
+
+def _build_analysis(chat_id: int) -> str:
+    rows = _read_trades(chat_id)
+    if not rows:
+        return "No trades recorded yet. Start trading and mark results with 👍/👎."
+
+    total  = len(rows)
+    wins   = sum(1 for r in rows if r.get("result") == "win")
+    losses = total - wins
+    wr     = wins / total * 100
+    profit = wins - losses
+
+    lines = [
+        "📊 Trade Analysis",
+        "",
+        f"Total trades: {total}",
+        f"Wins: {wins}  Losses: {losses}",
+        f"Win rate: {wr:.1f}%",
+        f"Simulated P&L: {'+'if profit>=0 else ''}{profit}$",
+        "",
+    ]
+
+    def _section(title: str, groups: dict) -> list[str]:
+        out = [title]
+        for label, (w, t) in groups.items():
+            bar = "█" * round(w/t*5) + "░" * (5 - round(w/t*5)) if t else "░░░░░"
+            out.append(f"  {label}: {w}/{t} ({w/t*100:.0f}%) {bar}")
+        return out + [""]
+
+    lines += _section("📈 By Asset:", _group_win_rate(rows, lambda r: r.get("asset", "?")))
+    lines += _section("🕐 By Time (UTC):", _group_win_rate(rows, _hour_window))
+    lines += _section("📅 By Day:", _group_win_rate(rows, _day_of_week))
+    lines += _section("🎯 By Confidence:", _group_win_rate(rows, _confidence_bin))
+    lines += _section("📉 By RSI:", _group_win_rate(rows, _rsi_bin))
+
+    best_win, worst_win = None, None
+    best_wr_val, worst_wr_val = -1.0, 101.0
+    for label, (w, t) in _group_win_rate(rows, _hour_window).items():
+        if t >= 3:
+            wr_val = w / t * 100
+            if wr_val > best_wr_val:
+                best_wr_val, best_win = wr_val, label
+            if wr_val < worst_wr_val:
+                worst_wr_val, worst_win = wr_val, label
+
+    if best_win:
+        lines.append(f"✅ Best window:  {best_win} ({best_wr_val:.0f}%)")
+    if worst_win:
+        lines.append(f"❌ Worst window: {worst_win} ({worst_wr_val:.0f}%)")
+
+    return "\n".join(lines)
+
+
+async def _maybe_send_10_trade_summary(chat_id: int) -> None:
+    """Send a summary every 10 trades and suggest restricting to best window."""
+    rows = _read_trades(chat_id)
+    if not rows or len(rows) % 10 != 0:
+        return
+
+    last_10 = rows[-10:]
+    wr_10   = _win_rate(last_10)
+    best_label, best_wr = _best_window(rows)
+
+    msg = (
+        f"🔔 10-Trade Milestone ({len(rows)} total)\n\n"
+        f"Last 10 win rate: {wr_10:.1f}%\n"
+    )
+    if best_label:
+        msg += (
+            f"Best time window: {best_label} ({best_wr:.0f}%)\n\n"
+            f"💡 Your win rate is highest between {best_label}.\n"
+            "Enable time-window restriction? Send /restrict_window to activate."
+        )
+    try:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception as exc:
+        logger.warning(f"Could not send 10-trade summary to {chat_id}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -735,8 +981,18 @@ async def _user_poll_loop(us: UserSession) -> None:
             if direction != "WAIT \u23f8" and us.settings.get("auto", False):
                 result    = compute_signal_advanced(candles)
                 price_str = f"{price:.5f}" if price else "N/A"
-                # Broadcast to primary chat + all extra broadcast IDs
+
+                # Check time-window restriction for each recipient
+                current_hour = datetime.utcnow().hour
                 for cid in us.all_broadcast_ids():
+                    ps = _get_user_persistent(cid)
+                    if ps.get("restrict_to_best_window"):
+                        ws = ps.get("best_window_start")
+                        we = ps.get("best_window_end")
+                        if ws is not None and we is not None:
+                            if not (ws <= current_hour < we):
+                                logger.debug(f"[{us.name}] Skipping signal for {cid} — outside window {ws}-{we} UTC")
+                                continue
                     await _send_signal_message(
                         chat_id=cid,
                         result=result,
@@ -868,9 +1124,18 @@ async def _send_signal_message(
 
     signal_id = _make_signal_id(chat_id)
     pending_signals[signal_id] = {
-        "user_id": chat_id,
-        "ts":      time.time(),
-        "voted":   False,
+        "user_id":    chat_id,
+        "ts":         time.time(),
+        "voted":      False,
+        # Metadata for CSV logging
+        "asset_label": asset_label,
+        "tf_label":    tf_label,
+        "direction":   "CALL" if result["direction"] == "HIGHER" else "PUT",
+        "confidence":  result.get("confidence", ""),
+        "rsi":         result.get("rsi", ""),
+        "price":       price_str,
+        "market":      result.get("market", ""),
+        "reason":      result.get("reason", ""),
     }
 
     img_url  = SIGNAL_IMG_BUY if direction == "HIGHER" else SIGNAL_IMG_SELL
@@ -992,6 +1257,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\nTap a button below, or use these commands:\n"
         "/signal \u2014 latest signal\n"
         "/stats \u2014 your win/loss statistics\n"
+        "/analyze \u2014 detailed trade analytics\n"
+        "/export \u2014 download your trade log (CSV)\n"
+        "/restrict_window \u2014 only receive signals in your best hours\n"
+        "/clear_restriction \u2014 remove time-window filter\n"
         "/autoon \u2014 enable auto-signals\n"
         "/autooff \u2014 disable auto-signals\n"
         "/status \u2014 connection status\n"
@@ -1491,6 +1760,12 @@ async def vote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     signal["voted"] = True
     _record_vote(user_id, won)
 
+    # Log to CSV
+    _log_trade(user_id, signal, "win" if won else "loss")
+
+    # Trigger 10-trade milestone summary (async, best-effort)
+    asyncio.create_task(_maybe_send_10_trade_summary(user_id))
+
     label = "Win \U0001f44d" if won else "Loss \U0001f44e"
     await query.answer(f"Recorded as {label}!")
 
@@ -1507,6 +1782,98 @@ async def vote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def vote_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Silently acknowledge taps on the 'Recorded' confirmation button."""
     await update.callback_query.answer("Already recorded.")
+
+
+# ---------------------------------------------------------------------------
+# Analytics & trade log commands
+# ---------------------------------------------------------------------------
+
+@_require_auth
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show detailed trade analytics from the user's CSV log."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("⏳ Analysing your trades...")
+    text = _build_analysis(chat_id)
+    # Split if too long for one message
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(text[i:i+4000])
+    else:
+        await update.message.reply_text(text)
+
+
+@_require_auth
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send the user's trades CSV as a file attachment."""
+    chat_id = update.effective_chat.id
+    path    = _csv_path(chat_id)
+    if not os.path.exists(path):
+        await update.message.reply_text("No trades recorded yet. Mark signals with 👍/👎 to start logging.")
+        return
+    try:
+        with open(path, "rb") as f:
+            await telegram_app.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=f"trades_{chat_id}.csv",
+                caption=f"📁 Your trade log — {len(_read_trades(chat_id))} trades",
+            )
+    except Exception as exc:
+        logger.error(f"export_command error: {exc}")
+        await update.message.reply_text(f"Could not send file: {exc}")
+
+
+@_require_auth
+async def restrict_window_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable time-window restriction based on the user's best trading window."""
+    chat_id = update.effective_chat.id
+    rows    = _read_trades(chat_id)
+    if len(rows) < 10:
+        await update.message.reply_text(
+            f"Not enough data yet ({len(rows)} trades). Need at least 10 trades to compute a best window."
+        )
+        return
+
+    best_label, best_wr = _best_window(rows)
+    if not best_label:
+        await update.message.reply_text("Could not determine a best window — need at least 3 trades per time slot.")
+        return
+
+    # Parse "HH-HH UTC" → start/end hours
+    try:
+        parts = best_label.replace(" UTC", "").split("-")
+        ws, we = int(parts[0]), int(parts[1])
+    except Exception:
+        await update.message.reply_text(f"Could not parse window: {best_label}")
+        return
+
+    ps = _get_user_persistent(chat_id)
+    ps["restrict_to_best_window"] = True
+    ps["best_window_start"]       = ws
+    ps["best_window_end"]         = we
+    _save_user_persistent_settings()
+
+    await update.message.reply_text(
+        f"✅ Time-window restriction enabled!\n\n"
+        f"Best window: {best_label} ({best_wr:.0f}% win rate)\n"
+        f"Auto-signals will only be sent between {ws:02d}:00 and {we:02d}:00 UTC.\n\n"
+        "Use /clear_restriction to remove this filter."
+    )
+
+
+@_require_auth
+async def clear_restriction_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove the time-window restriction for this user."""
+    chat_id = update.effective_chat.id
+    ps = _get_user_persistent(chat_id)
+    ps["restrict_to_best_window"] = False
+    ps["best_window_start"]       = None
+    ps["best_window_end"]         = None
+    _save_user_persistent_settings()
+    await update.message.reply_text(
+        "🔓 Time-window restriction removed.\n"
+        "You will now receive auto-signals at all hours."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1529,16 +1896,20 @@ conv_handler = ConversationHandler(
 telegram_app.add_handler(conv_handler)
 telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler, pattern="^vote:noop$"))
 telegram_app.add_handler(CallbackQueryHandler(vote_handler,      pattern="^vote:(win|loss):"))
-telegram_app.add_handler(CommandHandler("signal",    signal_command))
-telegram_app.add_handler(CommandHandler("stats",     stats_command))
-telegram_app.add_handler(CommandHandler("autoon",    autoon_command))
-telegram_app.add_handler(CommandHandler("autooff",   autooff_command))
-telegram_app.add_handler(CommandHandler("status",    status_command))
-telegram_app.add_handler(CommandHandler("debug",     debug_command))
-telegram_app.add_handler(CommandHandler("logs",      logs_command))
-telegram_app.add_handler(CommandHandler("reconnect", reconnect_command))
-telegram_app.add_handler(CommandHandler("setssid",   setssid_command))
-telegram_app.add_handler(CommandHandler("getssid",   getssid_command))
+telegram_app.add_handler(CommandHandler("signal",             signal_command))
+telegram_app.add_handler(CommandHandler("stats",              stats_command))
+telegram_app.add_handler(CommandHandler("analyze",            analyze_command))
+telegram_app.add_handler(CommandHandler("export",             export_command))
+telegram_app.add_handler(CommandHandler("restrict_window",    restrict_window_command))
+telegram_app.add_handler(CommandHandler("clear_restriction",  clear_restriction_command))
+telegram_app.add_handler(CommandHandler("autoon",             autoon_command))
+telegram_app.add_handler(CommandHandler("autooff",            autooff_command))
+telegram_app.add_handler(CommandHandler("status",             status_command))
+telegram_app.add_handler(CommandHandler("debug",              debug_command))
+telegram_app.add_handler(CommandHandler("logs",               logs_command))
+telegram_app.add_handler(CommandHandler("reconnect",          reconnect_command))
+telegram_app.add_handler(CommandHandler("setssid",            setssid_command))
+telegram_app.add_handler(CommandHandler("getssid",            getssid_command))
 
 
 # ---------------------------------------------------------------------------
@@ -1609,6 +1980,7 @@ async def lifespan(app: Starlette):
     await telegram_app.start()
     await reset_and_set_webhook()
     _load_stats()
+    _load_user_persistent_settings()
 
     # Build user registry and start per-user sessions
     configs = _load_user_configs()
