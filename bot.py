@@ -90,7 +90,7 @@ async def pocket_option_loop():
     """
     global latest_signal
 
-    logger.info("Pocket Option loop starting...")
+    logger.info(f"Pocket Option loop starting... po_client={po_client}")
 
     # po_client is already initialized in lifespan
     if not po_client:
@@ -98,13 +98,15 @@ async def pocket_option_loop():
         return
 
     try:
+        logger.info("Calling po_client.connect()...")
         connected = await po_client.connect()
+        logger.info(f"po_client.connect() returned: {connected}, is_connected={po_client.is_connected}")
         if not connected:
             logger.error("Pocket Option: failed to connect. Check SSID.")
             return
         logger.info("Pocket Option: connected successfully.")
     except Exception as e:
-        logger.error(f"Pocket Option connect error: {e}")
+        logger.error(f"Pocket Option connect error: {e}", exc_info=True)
         return
 
     while True:
@@ -176,6 +178,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sig = latest_signal
+    logger.info(f"Signal command called. po_client={po_client}, is_connected={po_client.is_connected if po_client else 'N/A'}")
     if sig["direction"] is None:
         po_ok = po_client is not None and po_client.is_connected
         await update.message.reply_text(
@@ -286,8 +289,12 @@ async def lifespan(app: Starlette):
     await reset_and_set_webhook()
 
     # Initialize PO client BEFORE starting the background loop
-    po_client = AsyncPocketOptionClient(ssid=SSID, is_demo=True)
-    logger.info("Pocket Option client initialized.")
+    try:
+        po_client = AsyncPocketOptionClient(ssid=SSID, is_demo=True)
+        logger.info(f"Pocket Option client initialized. Client object: {po_client}")
+    except Exception as e:
+        logger.error(f"Failed to initialize PO client: {e}")
+        po_client = None
 
     # Start Pocket Option background loop
     po_task = asyncio.create_task(pocket_option_loop())
