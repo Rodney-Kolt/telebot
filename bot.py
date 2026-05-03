@@ -2527,9 +2527,8 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "reversal": "Bollinger Bands — signals when price bounces off upper/lower band",
     }
     await update.message.reply_text(
-        f"✅ Strategy set to: {chosen}\n\n"
-        f"{descriptions[chosen]}\n\n"
-        "Use /signal to test it now."
+        f"✅ Selected strategy is now: {chosen.upper()}\n"
+        f"{descriptions[chosen]}"
     )
 
 
