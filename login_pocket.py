@@ -159,7 +159,7 @@ def extract_ssid_from_websocket(driver: uc.Chrome) -> tuple[str | None, int | No
                     try {
                         var payload = JSON.parse(data.slice(2));
                         if (Array.isArray(payload) && payload[0] === 'auth' && payload[1]) {
-                            window._po_ssid = payload[1].session || null;
+                            window._po_ssid = payload[1].session || payload[1].sessionToken || null;
                             window._po_uid  = payload[1].uid    || null;
                         }
                     } catch(e) {}
