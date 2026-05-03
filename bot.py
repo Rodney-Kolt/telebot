@@ -19,7 +19,7 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ConversationHandler, ContextTypes,
 )
-from pocketoptionapi_async import AsyncPocketOptionClient
+from BinaryOptionsToolsV2.pocketoption import PocketOptionAsync
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -689,31 +689,31 @@ async def retry_async(func, max_retries: int = 5, base_delay: float = 2.0):
 
 class SessionManager:
     """
-    Owns the AsyncPocketOptionClient lifecycle.
+    Wraps PocketOptionAsync (BinaryOptionsToolsV2) per user.
 
-    Responsibilities
-    ----------------
-    1. Pre-emptive refresh  – reconnects every 23 h via a scheduled task.
-    2. Keep-alive pings     – sends a ping every 20 s to prevent idle drops.
-    3. On-error reconnect   – detects auth/WS errors and reconnects
-                              automatically; notifies Telegram when the SSID
-                              itself needs a manual update.
+    BinaryOptionsToolsV2 differences from pocketoptionapi_async:
+    - Client is created synchronously; Rust core connects in the background.
+    - No is_connected property — use wait_for_assets() to confirm readiness.
+    - Built-in auto-reconnect in the Rust core (no manual ping loop needed).
+    - get_candles(asset, period_secs, offset_secs) returns List[Dict] with
+      plain string keys: "open", "high", "low", "close", "time".
+    - Pre-emptive 23h refresh still handled here to rotate the SSID.
     """
 
     def __init__(self, ssid: str, is_demo: bool = True,
                  chat_id: int = 0, name: str = "Unknown") -> None:
-        self.ssid:        str  = ssid
-        self.is_demo:     bool = is_demo
-        self.chat_id:     int  = chat_id
-        self.name:        str  = name
-        self.client:      "AsyncPocketOptionClient | None" = None
+        self.ssid:         str  = ssid
+        self.is_demo:      bool = is_demo
+        self.chat_id:      int  = chat_id
+        self.name:         str  = name
+        self.client:       "PocketOptionAsync | None" = None
         self.connected_at: "datetime | None" = None
+        self._ready:       bool = False
 
-        # Background task handles
-        self._ping_task:    "asyncio.Task | None" = None
+        # Pre-emptive refresh task
         self._refresh_task: "asyncio.Task | None" = None
 
-        # Reconnect state
+        # Reconnect guard
         self._reconnecting = False
         self._lock = asyncio.Lock()
 
@@ -723,33 +723,44 @@ class SessionManager:
 
     @property
     def is_connected(self) -> bool:
-        return self.client is not None and self.client.is_connected
+        """True once the client has been created and assets loaded."""
+        return self._ready and self.client is not None
 
     async def start(self) -> bool:
-        """Create client, connect, and launch background tasks."""
+        """Create client and wait for the connection to be ready."""
         async with self._lock:
             return await self._connect()
 
     async def stop(self) -> None:
         """Cancel background tasks and disconnect cleanly."""
-        self._cancel_tasks()
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        self._refresh_task = None
         if self.client:
             try:
                 await self.client.disconnect()
             except Exception as exc:
-                logger.warning(f"[{self.name}] SessionManager.stop disconnect error: {exc}")
+                logger.warning(f"[{self.name}] stop disconnect error: {exc}")
         self.client = None
+        self._ready = False
         self.connected_at = None
         logger.info(f"[{self.name}] SessionManager stopped.")
 
-    async def get_candles(self, **kwargs):
-        """Proxy to client.get_candles with exponential back-off retry."""
-        if not self.is_connected:
+    async def get_candles(self, asset: str, timeframe: int, count: int) -> list:
+        """
+        Fetch candles using BinaryOptionsToolsV2 API.
+
+        BinaryOptionsToolsV2.get_candles(asset, period_secs, offset_secs)
+        where offset_secs = count * period_secs gives enough history.
+        Returns List[Dict] with keys: time, open, high, low, close.
+        """
+        if not self.is_connected or self.client is None:
             await self._handle_error("get_candles called while disconnected")
             return []
+        offset = count * timeframe   # total seconds of history to fetch
         try:
             return await retry_async(
-                lambda: self.client.get_candles(**kwargs),
+                lambda: self.client.get_candles(asset, timeframe, offset),
                 max_retries=5,
                 base_delay=2.0,
             )
@@ -758,10 +769,6 @@ class SessionManager:
             return []
 
     async def notify_error(self, raw_error: str) -> None:
-        """
-        Called by the polling loop when it catches an exception.
-        Decides whether to reconnect or escalate to manual-refresh alert.
-        """
         lower = raw_error.lower()
         if any(m in lower for m in _AUTH_ERROR_MARKERS):
             await self._handle_error(raw_error)
@@ -771,89 +778,68 @@ class SessionManager:
     # ------------------------------------------------------------------ #
 
     async def _connect(self) -> bool:
-        """(Re)create client and connect. Must be called under self._lock."""
+        """Create a new PocketOptionAsync client and wait for readiness."""
+        # Tear down existing client
         if self.client:
             try:
                 await self.client.disconnect()
             except Exception:
                 pass
             self.client = None
+            self._ready = False
 
         try:
-            self.client = AsyncPocketOptionClient(
-                ssid=self.ssid,
-                is_demo=self.is_demo,
-            )
-            logger.info(f"[{self.name}] SessionManager: connecting to Pocket Option...")
-            connected = await self.client.connect()
+            logger.info(f"[{self.name}] Creating PocketOptionAsync client…")
+            # PocketOptionAsync.__init__ is synchronous; Rust connects in background
+            self.client = PocketOptionAsync(ssid=self.ssid)
+
+            # Wait up to 60 s for the connection and asset list to be ready
+            logger.info(f"[{self.name}] Waiting for assets (up to 60s)…")
+            await self.client.wait_for_assets(timeout=60.0)
+
         except Exception as exc:
-            log_error(f"[{self.name}] SessionManager connect exception: {exc}")
+            log_error(f"[{self.name}] Connect exception: {exc}")
             self.client = None
+            self._ready = False
             return False
 
-        if not connected:
-            log_error(f"[{self.name}] SessionManager: connect() returned False — SSID may be expired")
-            self.client = None
-            return False
-
+        self._ready = True
         self.connected_at = datetime.now()
-        logger.info(f"[{self.name}] SessionManager: connected at {self.connected_at.strftime('%H:%M:%S')}")
+        logger.info(
+            f"[{self.name}] Connected at {self.connected_at.strftime('%H:%M:%S')}"
+        )
 
-        self._cancel_tasks()
-        self._ping_task    = asyncio.create_task(self._ping_loop(),    name=f"po_ping_{self.chat_id}")
-        self._refresh_task = asyncio.create_task(self._refresh_loop(), name=f"po_refresh_{self.chat_id}")
+        # Start pre-emptive 23h refresh
+        if self._refresh_task and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        self._refresh_task = asyncio.create_task(
+            self._refresh_loop(), name=f"po_refresh_{self.chat_id}"
+        )
         return True
 
-    def _cancel_tasks(self) -> None:
-        for task in (self._ping_task, self._refresh_task):
-            if task and not task.done():
-                task.cancel()
-        self._ping_task = self._refresh_task = None
-
-    # ── Background task 1: keep-alive pings ──────────────────────────── #
-
-    async def _ping_loop(self) -> None:
-        """Send a lightweight ping every PING_INTERVAL_SECONDS."""
-        logger.info(f"[{self.name}] Ping loop started (interval={PING_INTERVAL_SECONDS}s)")
-        while True:
-            await asyncio.sleep(PING_INTERVAL_SECONDS)
-            if not self.is_connected:
-                logger.warning(f"[{self.name}] Ping loop: client disconnected, stopping ping loop")
-                return
-            try:
-                if hasattr(self.client, "get_balance"):
-                    await self.client.get_balance()
-                logger.debug(f"[{self.name}] Ping sent")
-            except Exception as exc:
-                await self._handle_error(f"Ping failed: {exc}")
-                return
-
-    # ── Background task 2: pre-emptive 23-hour refresh ───────────────── #
+    # ── Pre-emptive 23-hour refresh ───────────────────────────────────── #
 
     async def _refresh_loop(self) -> None:
         """Reconnect every PREEMPTIVE_REFRESH_HOURS to beat session expiry."""
         interval = PREEMPTIVE_REFRESH_HOURS * 3600
-        logger.info(f"[{self.name}] Refresh loop started (interval={PREEMPTIVE_REFRESH_HOURS}h)")
+        logger.info(f"[{self.name}] Refresh loop started ({PREEMPTIVE_REFRESH_HOURS}h)")
         await asyncio.sleep(interval)
-        logger.info(f"[{self.name}] SessionManager: pre-emptive session refresh triggered")
+        logger.info(f"[{self.name}] Pre-emptive session refresh triggered")
         async with self._lock:
             await self._connect()
 
     # ── Error handler ─────────────────────────────────────────────────── #
 
     async def _handle_error(self, error_msg: str) -> None:
-        """
-        Attempt reconnect with exponential back-off (up to 3 tries).
-        If all retries fail, send a Telegram alert asking for a new SSID.
-        """
+        """Reconnect with exponential back-off; alert user if all fail."""
         if self._reconnecting:
             return
         self._reconnecting = True
-        log_error(f"[{self.name}] SessionManager error: {error_msg}")
+        log_error(f"[{self.name}] Error: {error_msg}")
 
         delays = [5, 30, 120]
         for attempt, delay in enumerate(delays, start=1):
-            logger.info(f"[{self.name}] Reconnect attempt {attempt}/{len(delays)} in {delay}s...")
+            logger.info(f"[{self.name}] Reconnect {attempt}/{len(delays)} in {delay}s…")
             await asyncio.sleep(delay)
             async with self._lock:
                 success = await self._connect()
@@ -863,26 +849,24 @@ class SessionManager:
                 try:
                     await telegram_app.bot.send_message(
                         chat_id=self.chat_id,
-                        text="\u2705 Pocket Option reconnected successfully after a connection error.",
+                        text="\u2705 Pocket Option reconnected successfully.",
                     )
-                except Exception as exc:
-                    logger.error(f"[{self.name}] Telegram notify error: {exc}")
+                except Exception:
+                    pass
                 return
 
         self._reconnecting = False
-        log_error(f"[{self.name}] All reconnect attempts failed — SSID needs manual refresh")
+        log_error(f"[{self.name}] All reconnect attempts failed — SSID needs refresh")
         try:
             await telegram_app.bot.send_message(
                 chat_id=self.chat_id,
                 text=(
-                    "\u26a0\ufe0f Pocket Option connection lost and could not reconnect.\n\n"
-                    "Your SSID has likely expired. To fix without redeploying:\n"
+                    "\u26a0\ufe0f Pocket Option connection lost.\n\n"
+                    "Your SSID has likely expired. To fix:\n"
                     "1. Open pocketoption.com and log in\n"
-                    "2. Press F12 \u2192 Network tab \u2192 filter WS\n"
-                    '3. Find the message starting with 42["auth",\n'
-                    "4. Copy the full string\n"
-                    "5. Send: /setssid <paste the string here>\n\n"
-                    "The bot will reconnect immediately."
+                    "2. F12 \u2192 Network \u2192 WS filter\n"
+                    '3. Find 42["auth",... message\n'
+                    "4. Send: /setssid <paste here>"
                 ),
             )
         except Exception as exc:
@@ -894,7 +878,15 @@ class SessionManager:
 # ---------------------------------------------------------------------------
 
 def _closes(candles: list) -> list[float]:
-    return [float(c.close) for c in candles]
+    """Extract closing prices. Handles both dict candles (BinaryOptionsToolsV2)
+    and object candles (legacy pocketoptionapi_async)."""
+    result = []
+    for c in candles:
+        if isinstance(c, dict):
+            result.append(float(c["close"]))
+        else:
+            result.append(float(c.close))
+    return result
 
 
 def _ema(values: list[float], period: int) -> list[float]:
@@ -979,8 +971,17 @@ def _market_condition(candles: list) -> str:
     if len(candles) < 10:
         return "Unknown"
     closes = _closes(candles[-20:])
-    highs  = [float(c.high) for c in candles[-20:]] if hasattr(candles[-1], "high") else closes
-    lows   = [float(c.low)  for c in candles[-20:]] if hasattr(candles[-1], "low")  else closes
+    # Support both dict candles (BinaryOptionsToolsV2) and object candles
+    sample = candles[-1]
+    if isinstance(sample, dict):
+        highs = [float(c["high"]) for c in candles[-20:]]
+        lows  = [float(c["low"])  for c in candles[-20:]]
+    elif hasattr(sample, "high"):
+        highs = [float(c.high) for c in candles[-20:]]
+        lows  = [float(c.low)  for c in candles[-20:]]
+    else:
+        highs = closes
+        lows  = closes
     atr    = sum(h - l for h, l in zip(highs, lows)) / len(highs)
     price  = closes[-1]
     atr_pct = (atr / price) * 100 if price else 0
