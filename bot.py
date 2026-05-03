@@ -4642,6 +4642,132 @@ async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 @_require_auth
+async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Debug: show UID and demo/real flag parsed from the current SSID."""
+    chat_id = update.effective_chat.id
+    us      = _get_user_session(chat_id)
+    ssid    = us.ssid if us else ""
+
+    if not ssid:
+        await update.message.reply_text("No SSID set for this session.")
+        return
+
+    # Parse all fields from the SSID JSON
+    uid        = "could not parse"
+    is_demo_ssid = None
+    platform   = None
+    session_preview = ""
+    parse_error = None
+
+    try:
+        payload = json.loads(ssid[2:])   # strip leading "42"
+        auth_data = payload[1] if isinstance(payload, list) and len(payload) >= 2 else {}
+        uid           = str(auth_data.get("uid", "not found"))
+        is_demo_ssid  = auth_data.get("isDemo")
+        platform      = auth_data.get("platform")
+        session_val   = auth_data.get("session", "")
+        session_preview = f"{session_val[:12]}...{session_val[-6:]}" if len(session_val) > 18 else session_val
+    except Exception as exc:
+        parse_error = str(exc)
+
+    # is_demo from SessionManager (set at connection time)
+    sm_is_demo = us.session_manager.is_demo if us and us.session_manager else None
+
+    # Determine effective account type
+    if is_demo_ssid is not None:
+        account_type = "Demo 🎮" if is_demo_ssid else "Real 💵"
+        source = "SSID isDemo flag"
+    elif sm_is_demo is not None:
+        account_type = "Demo 🎮" if sm_is_demo else "Real 💵"
+        source = "SessionManager is_demo setting"
+    else:
+        account_type = "Unknown"
+        source = "no data"
+
+    lines = [
+        "🔍 Who Am I?\n",
+        f"UID: {uid}",
+        f"Account type: {account_type}",
+        f"Source: {source}",
+        f"Platform: {platform if platform is not None else 'N/A'}",
+        f"Session preview: {session_preview}",
+        f"SSID length: {len(ssid)} chars",
+    ]
+    if parse_error:
+        lines.append(f"\n⚠️ Parse error: {parse_error}")
+    if us and us.session_manager:
+        sm = us.session_manager
+        lines.append(f"\nSessionManager.is_demo: {sm.is_demo}")
+        lines.append(f"Connected: {'yes' if sm.is_connected else 'no'}")
+        if sm.connected_at:
+            lines.append(f"Connected since: {sm.connected_at.strftime('%H:%M:%S UTC')}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@_require_auth
+async def balance_raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Debug: fetch balance using raw client method and print full response."""
+    chat_id = update.effective_chat.id
+    us      = _get_user_session(chat_id)
+    sm      = us.session_manager if us else None
+
+    if not (sm and sm.is_connected and sm.client):
+        await update.message.reply_text(
+            "Not connected to Pocket Option.\n"
+            "Use /reconnect or /setssid to connect."
+        )
+        return
+
+    await update.message.reply_text("⏳ Fetching raw balance data...")
+
+    lines = ["💰 Raw Balance Response\n"]
+
+    # 1. Standard balance() call
+    try:
+        balance = await sm.client.balance()
+        lines.append(f"client.balance() → {balance}")
+        lines.append(f"Interpreted: ${float(balance):.2f}")
+    except Exception as exc:
+        lines.append(f"client.balance() → ERROR: {exc}")
+
+    # 2. Try payout() which may return richer data
+    try:
+        payout_raw = await sm.client.payout()
+        lines.append(f"\nclient.payout() raw:\n{str(payout_raw)[:500]}")
+    except Exception as exc:
+        lines.append(f"\nclient.payout() → ERROR: {exc}")
+
+    # 3. Try opened_deals() for active trade context
+    try:
+        deals_raw = await sm.client.opened_deals()
+        deals_str = str(deals_raw)[:300]
+        lines.append(f"\nclient.opened_deals() raw:\n{deals_str}")
+    except Exception as exc:
+        lines.append(f"\nclient.opened_deals() → ERROR: {exc}")
+
+    # 4. Server time for reference
+    try:
+        server_ts = await sm.client.get_server_time()
+        server_dt = datetime.utcfromtimestamp(server_ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+        lines.append(f"\nServer time: {server_dt}")
+    except Exception as exc:
+        lines.append(f"\nServer time → ERROR: {exc}")
+
+    # 5. is_demo flag
+    lines.append(f"\nis_demo: {sm.is_demo}")
+    lines.append(f"UID: {_parse_uid_from_ssid(us.ssid) or 'unknown'}")
+
+    text = "\n".join(lines)
+    # Split if too long
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await update.message.reply_text(text[i:i+4000])
+    else:
+        await update.message.reply_text(text)
+
+
+@_require_auth
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show all active tracked trades and paper balance."""
     chat_id = update.effective_chat.id
@@ -4993,6 +5119,8 @@ telegram_app.add_handler(CommandHandler("set_sl",             set_sl_command))
 telegram_app.add_handler(CommandHandler("dashboard",          dashboard_command))
 telegram_app.add_handler(CommandHandler("suggestion",         suggestion_command))
 telegram_app.add_handler(CommandHandler("account",            account_command))
+telegram_app.add_handler(CommandHandler("whoami",             whoami_command))
+telegram_app.add_handler(CommandHandler("balance_raw",        balance_raw_command))
 telegram_app.add_handler(CommandHandler("restrict_window",    restrict_window_command))
 telegram_app.add_handler(CommandHandler("clear_restriction",  clear_restriction_command))
 telegram_app.add_handler(CommandHandler("enable_news_filter",  enable_news_filter_command))
