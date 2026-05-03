@@ -338,13 +338,24 @@ def _get_user_persistent(chat_id: int) -> dict:
             "restrict_to_best_window": False,
             "best_window_start":       None,
             "best_window_end":         None,
-            "news_filter_enabled":     True,   # ON by default
-            "restrict_to_best_time":   False,  # /autotime on|off
-            "best_time_start":         None,   # computed from CSV
+            "news_filter_enabled":     True,
+            "restrict_to_best_time":   False,
+            "best_time_start":         None,
             "best_time_end":           None,
-            "best_time_updated":       None,   # ISO date of last refresh
+            "best_time_updated":       None,
+            # Per-user signal settings (persisted so they survive restarts)
+            "strategy":  "trend",   # "trend" | "reversal"
+            "auto":      False,
+            "asset":     "EUR/USD (OTC)",
+            "timeframe": "1 minute",
         }
-    return user_persistent_settings[str(chat_id)]
+    # Back-fill keys added in later versions
+    ps = user_persistent_settings[key]
+    ps.setdefault("strategy",  "trend")
+    ps.setdefault("auto",      False)
+    ps.setdefault("asset",     "EUR/USD (OTC)")
+    ps.setdefault("timeframe", "1 minute")
+    return ps
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +465,14 @@ def is_high_impact_news_approaching(asset_label: str,
 def _news_filter_active(chat_id: int) -> bool:
     """Return True if the news filter is enabled for this user (default: True)."""
     return _get_user_persistent(chat_id).get("news_filter_enabled", True)
+
+
+def _get_user_settings(chat_id: int) -> dict:
+    """
+    Returns the per-user signal settings dict (persisted in user_settings.json).
+    This is keyed by chat_id so broadcast recipients each have independent settings.
+    """
+    return _get_user_persistent(chat_id)
 
 
 def _csv_path(chat_id: int) -> str:
@@ -1375,7 +1394,9 @@ async def _user_poll_loop(us: UserSession) -> None:
                 asset=TRADE_ASSET, timeframe=CANDLE_PERIOD, count=CANDLE_COUNT
             )
 
-            user_strategy = us.settings.get("strategy", "trend")
+            # Use primary user's strategy for candle computation
+            primary_ps    = _get_user_settings(us.chat_id)
+            user_strategy = primary_ps.get("strategy", "trend")
             direction, reason = compute_signal(candles, strategy=user_strategy)
             price = None
             if candles:
@@ -1392,7 +1413,13 @@ async def _user_poll_loop(us: UserSession) -> None:
                 "timestamp": str(datetime.now()),
             }
 
-            if direction != "WAIT \u23f8" and us.settings.get("auto", False):
+            # Check if ANY recipient has auto ON before computing signal result
+            any_auto = any(
+                _get_user_settings(cid).get("auto", False)
+                for cid in us.all_broadcast_ids()
+            )
+
+            if direction != "WAIT \u23f8" and any_auto:
                 if user_strategy == "reversal":
                     result = compute_signal_bollinger(candles, CANDLE_PERIOD)
                 else:
@@ -1402,9 +1429,15 @@ async def _user_poll_loop(us: UserSession) -> None:
                 # Refresh calendar cache if stale (non-blocking)
                 await _ensure_calendar_fresh()
 
-                # Check time-window restriction and news filter for each recipient
+                # Check per-recipient settings before sending
                 current_hour = datetime.utcnow().hour
                 for cid in us.all_broadcast_ids():
+                    cid_ps = _get_user_settings(cid)
+
+                    # Skip if this recipient has auto OFF
+                    if not cid_ps.get("auto", False):
+                        continue
+
                     ps = _get_user_persistent(cid)
 
                     # ── restrict_to_best_time (/autotime on) ─────────────
@@ -1653,7 +1686,8 @@ def _require_auth(func):
 # ---------------------------------------------------------------------------
 
 def _main_menu_keyboard(user_id: int, us: "UserSession | None" = None) -> InlineKeyboardMarkup:
-    auto = us.settings.get("auto", False) if us else False
+    ps   = _get_user_settings(user_id)
+    auto = ps.get("auto", False)
     auto_label = "\U0001f514 Auto-signals: ON" if auto else "\U0001f515 Auto-signals: OFF"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("\U0001f4ca Get Signal",     callback_data="menu:signal")],
@@ -1683,7 +1717,7 @@ def _timeframe_keyboard() -> InlineKeyboardMarkup:
 
 
 def _settings_keyboard(user_id: int, us: "UserSession | None" = None) -> InlineKeyboardMarkup:
-    s = us.settings if us else DEFAULT_SETTINGS
+    s = _get_user_settings(user_id)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Asset: {s['asset']}",         callback_data="settings:asset")],
         [InlineKeyboardButton(f"Timeframe: {s['timeframe']}", callback_data="settings:tf")],
@@ -1762,7 +1796,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("\u26d4 You are not authorized to use this bot.")
         return ConversationHandler.END
 
-    settings = us.settings
+    settings = _get_user_settings(chat_id)   # persistent per-user settings
 
     # ── Main menu ────────────────────────────────────────────────────────
     if data == "menu:back":
@@ -1803,6 +1837,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if data == "menu:toggle_auto":
         settings["auto"] = not settings["auto"]
+        _save_user_persistent_settings()
         state = "ON \u2705" if settings["auto"] else "OFF \U0001f515"
         await query.edit_message_text(
             f"Auto-signals turned {state}\n\n"
@@ -1844,6 +1879,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if context.user_data.get("settings_mode") == "asset":
             settings["asset"] = asset_label
             context.user_data.pop("settings_mode", None)
+            _save_user_persistent_settings()
             await query.edit_message_text(
                 f"\u2705 Default asset set to: {asset_label}",
                 reply_markup=InlineKeyboardMarkup([
@@ -1865,6 +1901,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if context.user_data.get("settings_mode") == "tf":
             settings["timeframe"] = tf_label
             context.user_data.pop("settings_mode", None)
+            _save_user_persistent_settings()
             await query.edit_message_text(
                 f"\u2705 Default timeframe set to: {tf_label}",
                 reply_markup=InlineKeyboardMarkup([
@@ -1923,8 +1960,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manually request the latest signal for the user's default asset/timeframe."""
     us = _get_user_session(update.effective_chat.id)
-    asset_label = us.settings["asset"]
-    tf_label    = us.settings["timeframe"]
+    ps          = _get_user_settings(update.effective_chat.id)
+    asset_label = ps.get("asset",     DEFAULT_SETTINGS["asset"])
+    tf_label    = ps.get("timeframe", DEFAULT_SETTINGS["timeframe"])
     asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
     tf_seconds  = TIMEFRAMES.get(tf_label, 60)
 
@@ -1932,7 +1970,7 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"\u23f3 Fetching signal for {asset_label} / {tf_label}..."
     )
 
-    user_strategy = us.settings.get("strategy", "trend")
+    user_strategy = ps.get("strategy", "trend")
     result = await _fetch_signal(asset_code, tf_seconds, us, strategy=user_strategy)
 
     # News filter check for manual signals too
@@ -1962,7 +2000,8 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Enable auto-signals for this user."""
     us = _get_user_session(update.effective_chat.id)
-    us.settings["auto"] = True
+    _get_user_settings(update.effective_chat.id)["auto"] = True
+    _save_user_persistent_settings()
     await update.message.reply_text(
         "\U0001f514 Auto-signals enabled.\n"
         f"You will receive signals every {CANDLE_PERIOD // 60} minute(s).\n\n"
@@ -1974,7 +2013,8 @@ async def autoon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def autooff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Disable auto-signals for this user."""
     us = _get_user_session(update.effective_chat.id)
-    us.settings["auto"] = False
+    _get_user_settings(update.effective_chat.id)["auto"] = False
+    _save_user_persistent_settings()
     await update.message.reply_text(
         "\U0001f515 Auto-signals disabled.\n"
         "You will no longer receive scheduled signals.\n\n"
@@ -2462,7 +2502,7 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     us = _get_user_session(update.effective_chat.id)
 
     if not context.args:
-        current = us.settings.get("strategy", "trend")
+        current = _get_user_settings(update.effective_chat.id).get("strategy", "trend")
         await update.message.reply_text(
             f"📊 Current strategy: {current}\n\n"
             "Available strategies:\n"
@@ -2480,7 +2520,8 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    us.settings["strategy"] = chosen
+    _get_user_settings(update.effective_chat.id)["strategy"] = chosen
+    _save_user_persistent_settings()
     descriptions = {
         "trend":    "MACD+RSI — signals when RSI is extreme AND MACD confirms direction",
         "reversal": "Bollinger Bands — signals when price bounces off upper/lower band",
