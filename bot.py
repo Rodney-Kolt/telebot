@@ -2537,6 +2537,8 @@ def _main_menu_keyboard(user_id: int, us: "UserSession | None" = None) -> Inline
         # ── Settings & info ───────────────────────────────────────────────
         [InlineKeyboardButton("\u2699\ufe0f Settings",       callback_data="menu:settings"),
          InlineKeyboardButton("\u2139\ufe0f How it works",   callback_data="menu:howto")],
+        [InlineKeyboardButton("\U0001f511 Refresh SSID",     callback_data="menu:ssid"),
+         InlineKeyboardButton("\U0001f4b0 Account",          callback_data="menu:account")],
     ])
 
 
@@ -2926,6 +2928,103 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
         return ConversationHandler.END
 
+    if data == "menu:ssid":
+        current_ssid = us.ssid if us else ""
+        uid_str = _parse_uid_from_ssid(current_ssid) if current_ssid else "unknown"
+        preview = f"{current_ssid[:25]}...{current_ssid[-8:]}" if len(current_ssid) > 33 else current_ssid
+        po_ok   = us.session_manager is not None and us.session_manager.is_connected if us else False
+        await query.edit_message_text(
+            f"\U0001f511 SSID Manager\n\n"
+            f"Status: {'🟢 Connected' if po_ok else '🔴 Disconnected'}\n"
+            f"UID: {uid_str}\n"
+            f"Preview: {preview}\n\n"
+            "To refresh your SSID:\n"
+            "1. Open pocketoption.com → log in\n"
+            "2. F12 → Network → WS filter\n"
+            '3. Find 42["auth",... message → copy it\n'
+            "4. Send: /setssid <paste>\n\n"
+            "Or tap the button below for the full guide.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📖 Full guide",    callback_data="menu:ssid_guide")],
+                [InlineKeyboardButton("🔄 Reconnect now", callback_data="menu:reconnect")],
+                [InlineKeyboardButton("🔙 Back",          callback_data="menu:back")],
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:ssid_guide":
+        await query.edit_message_text(
+            "🔑 SSID Refresh Guide\n\n"
+            "1️⃣ Open https://pocketoption.com\n"
+            "2️⃣ Log in to your account\n"
+            "3️⃣ Press F12 → Network tab → WS filter\n"
+            "4️⃣ Refresh page if no WS connections\n"
+            "5️⃣ Click the WebSocket connection\n"
+            "6️⃣ Click Messages tab\n"
+            '7️⃣ Find 42["auth",... → copy entire string\n'
+            "8️⃣ Send: /setssid <paste>\n\n"
+            "Bot reconnects immediately. No redeploy needed.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="menu:ssid")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:reconnect":
+        if us and us.session_manager:
+            async with us.session_manager._lock:
+                success = await us.session_manager._connect()
+            state = "🟢 Reconnected!" if success else "🔴 Failed — try /setssid"
+        else:
+            state = "🔴 No session manager"
+        await query.edit_message_text(
+            state,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:account":
+        sm = us.session_manager if us else None
+        if not (sm and sm.is_connected and sm.client):
+            await query.edit_message_text(
+                "🔴 Not connected to Pocket Option.\nUse 🔑 Refresh SSID to reconnect.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔑 Refresh SSID", callback_data="menu:ssid")],
+                    [InlineKeyboardButton("🔙 Back",         callback_data="menu:back")],
+                ]),
+            )
+            return ConversationHandler.END
+        await query.edit_message_text("⏳ Fetching balance...")
+        try:
+            balance = await sm.client.balance()
+            try:
+                server_ts = await sm.client.get_server_time()
+                server_dt = datetime.utcfromtimestamp(server_ts).strftime("%H:%M:%S UTC")
+            except Exception:
+                server_dt = "N/A"
+            ps_u = _get_user_settings(user_id)
+            paper_bal = float(ps_u.get("paper_balance", PAPER_START_BALANCE))
+            await query.edit_message_text(
+                f"💰 Account\n\n"
+                f"Type: {'Demo 🎮' if sm.is_demo else 'Real 💵'}\n"
+                f"Balance: ${balance:.2f}\n"
+                f"Server time: {server_dt}\n\n"
+                f"📊 Paper balance: ${paper_bal:.2f}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="menu:back")]
+                ]),
+            )
+        except Exception as exc:
+            await query.edit_message_text(
+                f"Could not fetch balance: {exc}",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔙 Back", callback_data="menu:back")]
+                ]),
+            )
+        return ConversationHandler.END
+
     # ── Settings sub-menu ────────────────────────────────────────────────
     if data == "settings:asset":
         context.user_data["settings_mode"] = "asset"
@@ -3188,6 +3287,33 @@ def _parse_uid_from_ssid(ssid: str) -> str | None:
     except Exception:
         pass
     return None
+
+
+@_require_auth
+async def login_help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Step-by-step guide to refresh your SSID in 30 seconds."""
+    await update.message.reply_text(
+        "🔑 How to refresh your SSID (30 seconds)\n\n"
+        "Your SSID is the WebSocket auth token Pocket Option uses.\n"
+        "It lasts weeks — you only need this when the bot loses connection.\n\n"
+        "Steps:\n"
+        "1️⃣ Open https://pocketoption.com in Chrome/Firefox\n"
+        "2️⃣ Log in to your account\n"
+        "3️⃣ Press F12 to open DevTools\n"
+        "4️⃣ Click the Network tab\n"
+        "5️⃣ Click the WS filter button\n"
+        "6️⃣ Refresh the page (F5) if no WS connections appear\n"
+        "7️⃣ Click on the WebSocket connection (URL starts with wss://)\n"
+        "8️⃣ Click the Messages tab\n"
+        '9️⃣ Find the message starting with 42["auth",\n'
+        "🔟 Click it, select all, copy\n\n"
+        "Then send it here:\n"
+        "/setssid <paste your copied string>\n\n"
+        "Example:\n"
+        '/setssid 42["auth",{"session":"abc123...","isDemo":1,"uid":27658142,"platform":2}]\n\n'
+        "The bot reconnects immediately — no redeploy needed.\n\n"
+        "💡 Tip: Also update the SSID env var on Render so it survives restarts."
+    )
 
 
 @_require_auth
@@ -4764,6 +4890,7 @@ telegram_app.add_handler(CommandHandler("logs",               logs_command))
 telegram_app.add_handler(CommandHandler("reconnect",          reconnect_command))
 telegram_app.add_handler(CommandHandler("setssid",            setssid_command))
 telegram_app.add_handler(CommandHandler("getssid",            getssid_command))
+telegram_app.add_handler(CommandHandler("login_help",         login_help_command))
 
 
 # ---------------------------------------------------------------------------
