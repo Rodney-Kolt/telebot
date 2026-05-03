@@ -1255,6 +1255,83 @@ def _market_condition(candles: list) -> str:
     return "Ranging"
 
 
+def _bollinger_ranging_signal(
+    closes: list[float],
+    rsi: float,
+    timeframe_seconds: int = 60,
+) -> dict:
+    """
+    Bollinger Bands proximity signal for ranging markets.
+    Used as a fallback inside compute_signal_advanced when MACD+RSI gives no signal.
+
+    CALL if: price within 0.05% of lower band AND RSI < 45
+    PUT  if: price within 0.05% of upper band AND RSI > 55
+    Confidence = 70 + (0.05 - dist) * 100, capped at 85.
+    """
+    base = {"direction": "WAIT", "confidence": 0, "strategy": "BB-Ranging"}
+
+    middle, upper, lower = calculate_bollinger_bands(closes, period=20, std_dev=2.0)
+    if middle is None:
+        base["reason"] = "No signal — ranging without band touch (insufficient BB data)"
+        return base
+
+    last_close = closes[-1]
+    if last_close <= 0:
+        base["reason"] = "No signal — invalid price"
+        return base
+
+    dist_to_lower = (last_close - lower) / last_close * 100
+    dist_to_upper = (upper - last_close) / last_close * 100
+
+    logger.debug(
+        f"BB-Ranging | RSI={rsi:.1f} | Price={last_close:.5f} "
+        f"| Upper={upper:.5f} | Lower={lower:.5f} "
+        f"| dist_lower={dist_to_lower:.4f}% | dist_upper={dist_to_upper:.4f}%"
+    )
+
+    THRESHOLD = 0.05   # 0.05% proximity threshold
+
+    if dist_to_lower <= THRESHOLD and rsi < 45:
+        raw_conf   = 70 + (THRESHOLD - dist_to_lower) * 100
+        confidence = min(85, max(60, int(raw_conf)))
+        if timeframe_seconds <= 5:
+            confidence = max(55, confidence - 8)
+        elif timeframe_seconds <= 15:
+            confidence = max(55, confidence - 4)
+        return {
+            "direction":  "HIGHER",
+            "confidence": confidence,
+            "strategy":   "BB-Ranging",
+            "reason": (
+                f"Ranging: price near lower BB ({lower:.5f}), "
+                f"dist={dist_to_lower:.4f}%, RSI={rsi:.1f} (oversold)"
+            ),
+        }
+
+    if dist_to_upper <= THRESHOLD and rsi > 55:
+        raw_conf   = 70 + (THRESHOLD - dist_to_upper) * 100
+        confidence = min(85, max(60, int(raw_conf)))
+        if timeframe_seconds <= 5:
+            confidence = max(55, confidence - 8)
+        elif timeframe_seconds <= 15:
+            confidence = max(55, confidence - 4)
+        return {
+            "direction":  "LOWER",
+            "confidence": confidence,
+            "strategy":   "BB-Ranging",
+            "reason": (
+                f"Ranging: price near upper BB ({upper:.5f}), "
+                f"dist={dist_to_upper:.4f}%, RSI={rsi:.1f} (overbought)"
+            ),
+        }
+
+    base["reason"] = (
+        f"No signal — ranging without band touch "
+        f"(dist_lower={dist_to_lower:.4f}%, dist_upper={dist_to_upper:.4f}%, RSI={rsi:.1f})"
+    )
+    return base
+
+
 def compute_signal_advanced(
     candles: list,
     timeframe_seconds: int = 60,
@@ -1345,14 +1422,26 @@ def compute_signal_advanced(
             )
 
         else:
-            # Conditions not both met — explain why
-            if rsi < 35:
-                reason = f"RSI={rsi:.1f} oversold but MACD not yet bullish (hist={hist_val:+.6f})"
-            elif rsi > 65:
-                reason = f"RSI={rsi:.1f} overbought but MACD not yet bearish (hist={hist_val:+.6f})"
+            # MACD+RSI conditions not met — try Bollinger fallback for ranging markets
+            if market == "Ranging" and len(closes) >= 22:
+                bb_result = _bollinger_ranging_signal(closes, rsi, timeframe_seconds)
+                if bb_result["direction"] != "WAIT":
+                    # Merge BB result into our result dict
+                    result.update(bb_result)
+                    result["macd"]        = round(macd_val,   6)
+                    result["macd_signal"] = round(signal_val, 6)
+                    result["histogram"]   = round(hist_val,   6)
+                    return result
+                # BB also found nothing — use its reason
+                result["reason"] = bb_result["reason"]
             else:
-                reason = f"RSI={rsi:.1f} neutral — waiting for RSI extreme + MACD confirmation"
-            result["reason"] = reason
+                if rsi < 35:
+                    reason = f"RSI={rsi:.1f} oversold but MACD not yet bullish (hist={hist_val:+.6f})"
+                elif rsi > 65:
+                    reason = f"RSI={rsi:.1f} overbought but MACD not yet bearish (hist={hist_val:+.6f})"
+                else:
+                    reason = f"RSI={rsi:.1f} neutral — waiting for RSI extreme + MACD confirmation"
+                result["reason"] = reason
             return result
 
         # Timeframe noise penalty
