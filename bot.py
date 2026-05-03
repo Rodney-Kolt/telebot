@@ -54,6 +54,28 @@ TRADE_ASSET   = "EURUSD_otc"
 CANDLE_PERIOD = 60    # seconds for the auto-signal loop
 CANDLE_COUNT  = 50    # candles to fetch (enough for RSI-14 + EMA-20)
 
+# ---------------------------------------------------------------------------
+# Multi-asset scanner configuration
+# ---------------------------------------------------------------------------
+_DEFAULT_SCAN_ASSETS = [
+    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc",
+    "USDZARUSD_otc", "EURTRY_otc", "USDINR_otc",
+]
+_MAX_SCAN_ASSETS = 10   # Render free tier limit
+
+def _load_scan_assets() -> list[str]:
+    """Parse SCAN_ASSETS env var (comma-separated) or return defaults."""
+    raw = os.environ.get("SCAN_ASSETS", "").strip()
+    if raw:
+        assets = [a.strip() for a in raw.split(",") if a.strip()]
+        return assets[:_MAX_SCAN_ASSETS]
+    return _DEFAULT_SCAN_ASSETS
+
+SCAN_ASSETS: list[str] = _load_scan_assets()
+
+# Default cooldown between signals for the same asset (seconds)
+DEFAULT_COOLDOWN_SECONDS = 120
+
 PREEMPTIVE_REFRESH_HOURS = 23   # reconnect before the 24-h session boundary
 PING_INTERVAL_SECONDS    = 20   # keep-alive ping cadence
 SIGNAL_EXPIRY_SEC        = 600  # 10 minutes
@@ -366,7 +388,9 @@ def _get_user_persistent(chat_id: int) -> dict:
     ps.setdefault("auto",          False)
     ps.setdefault("asset",         "EUR/USD (OTC)")
     ps.setdefault("timeframe",     "1 minute")
-    ps.setdefault("auto_strategy", True)   # ADX-based auto strategy selection
+    ps.setdefault("auto_strategy", True)
+    ps.setdefault("scanner",       False)   # multi-asset scanner ON/OFF
+    ps.setdefault("cooldown",      DEFAULT_COOLDOWN_SECONDS)
     return ps
 
 
@@ -1549,7 +1573,177 @@ def compute_signal(candles: list, strategy: str = "trend") -> tuple[str, str]:
 # Per-user polling loop
 # ---------------------------------------------------------------------------
 
-async def _user_poll_loop(us: UserSession) -> None:
+# ---------------------------------------------------------------------------
+# Multi-asset scanner
+# ---------------------------------------------------------------------------
+# Per-UserSession cooldown tracker: {asset_code: last_signal_timestamp}
+# Stored on the UserSession via us._scanner_cooldowns (set in lifespan)
+
+def _get_display_label(asset_code: str) -> str:
+    """Reverse-lookup display label from asset code, or return code itself."""
+    for label, code in ASSETS.items():
+        if code == asset_code:
+            return label
+    return asset_code
+
+
+async def _scan_asset_loop(
+    us: "UserSession",
+    asset_code: str,
+) -> None:
+    """
+    Subscribe to one asset and generate signals whenever a new candle closes.
+    Runs as an independent asyncio.Task per asset per UserSession.
+    """
+    from datetime import timedelta as _td
+
+    logger.info(f"[{us.name}] Scanner starting for {asset_code}")
+
+    # Initialise cooldown tracker on the UserSession if not present
+    if not hasattr(us, "_scanner_cooldowns"):
+        us._scanner_cooldowns = {}
+
+    sm = us.session_manager
+    if not sm or not sm.is_connected or sm.client is None:
+        logger.warning(f"[{us.name}] Scanner: not connected, skipping {asset_code}")
+        return
+
+    asset_label = _get_display_label(asset_code)
+
+    try:
+        # Subscribe to timed updates every CANDLE_PERIOD seconds
+        subscription = await sm.client.subscribe_symbol_timed(
+            asset_code, _td(seconds=CANDLE_PERIOD)
+        )
+
+        async for _tick in subscription:
+            # Check if scanner is still enabled for any recipient
+            any_scanner = any(
+                _get_user_settings(cid).get("scanner", False)
+                for cid in us.all_broadcast_ids()
+            )
+            if not any_scanner:
+                logger.info(f"[{us.name}] Scanner disabled, stopping {asset_code}")
+                return
+
+            # Fetch candle history for signal computation
+            try:
+                candles = await sm.get_candles(
+                    asset=asset_code,
+                    timeframe=CANDLE_PERIOD,
+                    count=CANDLE_COUNT,
+                )
+            except Exception as exc:
+                log_error(f"[{us.name}] Scanner candle fetch error ({asset_code}): {exc}")
+                continue
+
+            if not candles or len(candles) < 20:
+                continue
+
+            # Compute signal for each recipient using their own strategy
+            now = time.time()
+            for cid in us.all_broadcast_ids():
+                cid_ps = _get_user_settings(cid)
+
+                # Skip if scanner is off for this recipient
+                if not cid_ps.get("scanner", False):
+                    continue
+
+                # Skip if auto is off (scanner respects auto toggle)
+                if not cid_ps.get("auto", False):
+                    continue
+
+                # Cooldown check per (user, asset)
+                cooldown_key = f"{cid}:{asset_code}"
+                last_ts = us._scanner_cooldowns.get(cooldown_key, 0)
+                cooldown_secs = cid_ps.get("cooldown", DEFAULT_COOLDOWN_SECONDS)
+                if now - last_ts < cooldown_secs:
+                    continue
+
+                # Time-window restriction
+                current_hour = datetime.utcnow().hour
+                ps = _get_user_persistent(cid)
+                if ps.get("restrict_to_best_time"):
+                    ts = ps.get("best_time_start")
+                    te = ps.get("best_time_end")
+                    if ts is not None and te is not None and not (ts <= current_hour < te):
+                        continue
+
+                # News filter
+                if _news_filter_active(cid):
+                    await _ensure_calendar_fresh()
+                    blocked, event_desc = is_high_impact_news_approaching(asset_label)
+                    if blocked:
+                        continue
+
+                # ADX auto-strategy
+                strategy = cid_ps.get("strategy", "trend")
+                try:
+                    highs  = [float(c["high"]  if isinstance(c, dict) else c.high)  for c in candles]
+                    lows   = [float(c["low"]   if isinstance(c, dict) else c.low)   for c in candles]
+                    closes = _closes(candles)
+                    adx_val = calculate_adx(highs, lows, closes)
+                    if cid_ps.get("auto_strategy", True) and adx_val is not None:
+                        strategy = _adx_strategy_recommendation(adx_val)
+                except Exception:
+                    adx_val = None
+
+                # Compute signal
+                if strategy == "reversal":
+                    result = compute_signal_bollinger(candles, CANDLE_PERIOD)
+                else:
+                    result = compute_signal_advanced(candles, CANDLE_PERIOD)
+
+                if result["direction"] == "WAIT":
+                    continue
+
+                # Signal fired — update cooldown and send
+                us._scanner_cooldowns[cooldown_key] = now
+
+                price = None
+                try:
+                    c = candles[-1]
+                    price = float(c["close"] if isinstance(c, dict) else c.close)
+                except Exception:
+                    pass
+
+                price_str = f"{price:.5f}" if price else "N/A"
+                result["adx"] = adx_val
+                result["effective_strategy"] = strategy
+
+                logger.info(
+                    f"[{us.name}] Scanner signal: {asset_code} "
+                    f"{result['direction']} ({strategy}) conf={result['confidence']}%"
+                )
+
+                await _send_signal_message(
+                    chat_id=cid,
+                    result=result,
+                    asset_label=asset_label,
+                    tf_label="1 minute",
+                    price_str=price_str,
+                )
+
+    except asyncio.CancelledError:
+        logger.info(f"[{us.name}] Scanner task cancelled for {asset_code}")
+    except Exception as exc:
+        log_error(f"[{us.name}] Scanner loop error ({asset_code}): {exc}")
+
+
+async def _start_scanner(us: "UserSession") -> list[asyncio.Task]:
+    """Start one scan task per asset. Returns list of tasks."""
+    tasks = []
+    for asset_code in SCAN_ASSETS:
+        task = asyncio.create_task(
+            _scan_asset_loop(us, asset_code),
+            name=f"scan_{us.chat_id}_{asset_code}",
+        )
+        tasks.append(task)
+    logger.info(f"[{us.name}] Scanner started for {len(tasks)} assets: {SCAN_ASSETS}")
+    return tasks
+
+
+async def _user_poll_loop(us: "UserSession") -> None:
     """Independent polling loop for one user's Pocket Option connection."""
     logger.info(f"[{us.name}] Polling loop started.")
 
@@ -1969,6 +2163,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/strategy \u2014 switch between trend / reversal\n"
         "/adx \u2014 current ADX value + recommended strategy\n"
         "/autostrategy on|off \u2014 let ADX choose strategy automatically\n"
+        "/scanner on|off \u2014 scan all assets simultaneously\n"
+        "/set_cooldown <s> \u2014 signal cooldown per asset\n"
         "/recommend \u2014 best assets, windows & strategy from your history\n"
         "/stats \u2014 your win/loss statistics\n"
         "/analyze \u2014 detailed trade analytics\n"
@@ -3005,6 +3201,109 @@ async def recommend_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text("\n".join(lines))
 
 
+@_require_auth
+async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle multi-asset scanner mode.
+
+    Usage:
+      /scanner on   — scan all SCAN_ASSETS for signals
+      /scanner off  — only signal for your selected asset (default)
+      /scanner      — show current status
+    """
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+    us      = _get_user_session(chat_id)
+
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1:
+            args = parts[1:]
+
+    if not args:
+        enabled = ps.get("scanner", False)
+        await update.message.reply_text(
+            f"📡 Multi-Asset Scanner: {'ON ✅' if enabled else 'OFF 🔕'}\n\n"
+            f"Scanning {len(SCAN_ASSETS)} assets:\n"
+            + "\n".join(f"  • {a}" for a in SCAN_ASSETS) +
+            "\n\nCommands:\n"
+            "  /scanner on  — enable\n"
+            "  /scanner off — disable\n"
+            f"  /set_cooldown <seconds> — signal cooldown (current: {ps.get('cooldown', DEFAULT_COOLDOWN_SECONDS)}s)"
+        )
+        return
+
+    arg = args[0].lower()
+    if arg == "on":
+        ps["scanner"] = True
+        _save_user_persistent_settings()
+        # Start scanner tasks if not already running
+        if us and not getattr(us, "_scanner_tasks", None):
+            us._scanner_tasks = await _start_scanner(us)
+        await update.message.reply_text(
+            f"📡 Scanner ENABLED ✅\n"
+            f"Monitoring {len(SCAN_ASSETS)} assets every {CANDLE_PERIOD}s.\n"
+            f"Cooldown: {ps.get('cooldown', DEFAULT_COOLDOWN_SECONDS)}s per asset.\n\n"
+            "⚠️ Make sure /autoon is also enabled to receive signals."
+        )
+    elif arg == "off":
+        ps["scanner"] = False
+        _save_user_persistent_settings()
+        # Cancel scanner tasks
+        if us and getattr(us, "_scanner_tasks", None):
+            for t in us._scanner_tasks:
+                if not t.done():
+                    t.cancel()
+            us._scanner_tasks = []
+        await update.message.reply_text(
+            "📡 Scanner DISABLED 🔕\n"
+            "Signals will only be sent for your selected asset (/signal)."
+        )
+    else:
+        await update.message.reply_text("Usage: /scanner on  or  /scanner off")
+
+
+@_require_auth
+async def set_cooldown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the per-asset signal cooldown duration.
+
+    Usage: /set_cooldown <seconds>
+    Default: 120 seconds. Minimum: 30 seconds.
+    """
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1:
+            args = parts[1:]
+
+    if not args:
+        current = ps.get("cooldown", DEFAULT_COOLDOWN_SECONDS)
+        await update.message.reply_text(
+            f"Current cooldown: {current}s\n\n"
+            "Usage: /set_cooldown <seconds>\n"
+            "Example: /set_cooldown 60\n"
+            "Minimum: 30 seconds"
+        )
+        return
+
+    try:
+        secs = int(args[0])
+        if secs < 30:
+            await update.message.reply_text("Minimum cooldown is 30 seconds.")
+            return
+        ps["cooldown"] = secs
+        _save_user_persistent_settings()
+        await update.message.reply_text(
+            f"✅ Cooldown set to {secs}s\n"
+            "The scanner will wait at least this long before sending another signal for the same asset."
+        )
+    except ValueError:
+        await update.message.reply_text("Invalid value. Usage: /set_cooldown 120")
+
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
@@ -3030,6 +3329,8 @@ telegram_app.add_handler(CommandHandler("autotime",           autotime_command))
 telegram_app.add_handler(CommandHandler("adx",                adx_command))
 telegram_app.add_handler(CommandHandler("autostrategy",       autostrategy_command))
 telegram_app.add_handler(CommandHandler("recommend",          recommend_command))
+telegram_app.add_handler(CommandHandler("scanner",            scanner_command))
+telegram_app.add_handler(CommandHandler("set_cooldown",       set_cooldown_command))
 telegram_app.add_handler(CommandHandler("restrict_window",    restrict_window_command))
 telegram_app.add_handler(CommandHandler("clear_restriction",  clear_restriction_command))
 telegram_app.add_handler(CommandHandler("enable_news_filter",  enable_news_filter_command))
@@ -3144,6 +3445,13 @@ async def lifespan(app: Starlette):
             _user_poll_loop(us), name=f"poll_{us.chat_id}"
         )
 
+        # Start scanner tasks if any registered user has scanner enabled
+        us._scanner_tasks = []
+        us._scanner_cooldowns = {}
+        all_cids = [us.chat_id] + us.broadcast_ids
+        if any(_get_user_settings(cid).get("scanner", False) for cid in all_cids):
+            us._scanner_tasks = await _start_scanner(us)
+
         # Register primary chat_id
         user_registry[us.chat_id] = us
         logger.info(f"Registered user: {us.name} (chat_id={us.chat_id})")
@@ -3158,13 +3466,20 @@ async def lifespan(app: Starlette):
     yield  # ── server is running ──────────────────────────────────────────
 
     # Shutdown all user sessions
+    seen = set()
     for us in user_registry.values():
+        if id(us) in seen:
+            continue
+        seen.add(id(us))
         if us.poll_task and not us.poll_task.done():
             us.poll_task.cancel()
             try:
                 await us.poll_task
             except (asyncio.CancelledError, Exception):
                 pass
+        for t in getattr(us, "_scanner_tasks", []):
+            if not t.done():
+                t.cancel()
         if us.session_manager:
             await us.session_manager.stop()
 
