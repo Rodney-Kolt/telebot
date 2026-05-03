@@ -1,24 +1,23 @@
 """
 login_pocket.py — Pocket Option SSID Extractor
 ================================================
-Runs Chrome on your PC, logs into Pocket Option, extracts the SSID,
-and sends it to your Telegram bot via /setssid.
+Runs Chrome on your PC, logs into Pocket Option, intercepts the
+WebSocket auth message to extract the correct SSID, and sends it
+to your Telegram bot via /setssid.
 
-You solve the CAPTCHA manually in the browser window that opens.
-After that, everything is automatic.
+The SSID for BinaryOptionsToolsV2 is the short session token inside
+the WebSocket 42["auth",...] message — NOT the ci_session HTTP cookie.
 
 Usage:
     python login_pocket.py
     python login_pocket.py --email you@example.com --password yourpass
 
-Environment variables (alternative to command-line args):
-    PO_EMAIL      your Pocket Option email
-    PO_PASSWORD   your Pocket Option password
-    BOT_TOKEN     your Telegram bot token
-    CHAT_ID       your Telegram chat ID
+Environment variables:
+    PO_EMAIL, PO_PASSWORD, BOT_TOKEN, CHAT_ID
+    WORKER_URL, WORKER_API_KEY  (optional Cloudflare Worker)
 
 Dependencies:
-    pip install undetected-chromedriver selenium requests
+    pip install undetected-chromedriver selenium requests setuptools
 """
 
 import argparse
@@ -29,53 +28,38 @@ import time
 import urllib.request
 import urllib.parse
 
-# ---------------------------------------------------------------------------
-# Dependency check
-# ---------------------------------------------------------------------------
 try:
     import undetected_chromedriver as uc
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
     from selenium.common.exceptions import TimeoutException, NoSuchElementException
-except ImportError:
-    print("Missing dependencies. Run:")
-    print("    pip install undetected-chromedriver selenium requests")
+except ImportError as e:
+    print(f"Import error: {e}")
+    print("Run:")
+    print(r"  C:\Users\rodoa\AppData\Local\Python\pythoncore-3.14-64\python.exe -m pip install undetected-chromedriver selenium requests setuptools")
     sys.exit(1)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-LOGIN_URL    = "https://pocketoption.com/en/login/"
-CABINET_URL  = "https://pocketoption.com/en/cabinet/"
-WAIT_TIMEOUT = 60   # seconds to wait for login to complete
-CAPTCHA_WAIT = 30   # extra seconds for you to solve CAPTCHA manually
+LOGIN_URL   = "https://pocketoption.com/en/login/"
+TRADE_URL   = "https://pocketoption.com/en/cabinet/demo-quick-high-low/"
+WAIT_SECS   = 60   # seconds to wait for page load / CAPTCHA
 
 
 def get_config() -> dict:
-    """
-    Read credentials from command-line args, then env vars, then prompt.
-    Returns dict with keys: email, password, bot_token, chat_id.
-    """
-    parser = argparse.ArgumentParser(
-        description="Extract Pocket Option SSID and send to Telegram bot"
-    )
-    parser.add_argument("--email",     default="", help="Pocket Option email")
-    parser.add_argument("--password",  default="", help="Pocket Option password")
-    parser.add_argument("--bot-token", default="", help="Telegram bot token")
-    parser.add_argument("--chat-id",   default="", help="Telegram chat ID")
-    parser.add_argument("--is-demo",   default="1", help="1=demo, 0=real (default: 1)")
-    parser.add_argument("--no-send",   action="store_true",
-                        help="Print SSID only, don't send to Telegram")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--email",     default="")
+    parser.add_argument("--password",  default="")
+    parser.add_argument("--bot-token", default="")
+    parser.add_argument("--chat-id",   default="")
+    parser.add_argument("--is-demo",   default="1")
+    parser.add_argument("--no-send",   action="store_true")
     args = parser.parse_args()
 
     email     = args.email     or os.environ.get("PO_EMAIL",    "")
     password  = args.password  or os.environ.get("PO_PASSWORD", "")
     bot_token = args.bot_token or os.environ.get("BOT_TOKEN",   "")
     chat_id   = args.chat_id   or os.environ.get("CHAT_ID",     "")
-    is_demo   = int(args.is_demo)
 
-    # Prompt for anything still missing
     if not email:
         email = input("Pocket Option email: ").strip()
     if not password:
@@ -88,270 +72,169 @@ def get_config() -> dict:
             chat_id = input("Telegram CHAT_ID: ").strip()
 
     return {
-        "email":     email,
-        "password":  password,
-        "bot_token": bot_token,
-        "chat_id":   chat_id,
-        "is_demo":   is_demo,
-        "no_send":   args.no_send,
+        "email": email, "password": password,
+        "bot_token": bot_token, "chat_id": chat_id,
+        "is_demo": int(args.is_demo), "no_send": args.no_send,
     }
 
 
-# ---------------------------------------------------------------------------
-# Browser automation
-# ---------------------------------------------------------------------------
-
 def launch_browser() -> uc.Chrome:
-    """
-    Launch undetected Chrome.
-    undetected_chromedriver patches Chrome to avoid bot detection.
-    The browser window is visible so you can solve CAPTCHA manually.
-    """
     print("Launching Chrome...")
     options = uc.ChromeOptions()
-    # Keep browser visible (do NOT add --headless)
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1280,800")
-
-    driver = uc.Chrome(options=options, use_subprocess=True)
-    return driver
+    return uc.Chrome(options=options, use_subprocess=True, version_main=147)
 
 
-def fill_login_form(driver: uc.Chrome, email: str, password: str) -> None:
-    """Navigate to login page and fill in credentials."""
+def login(driver: uc.Chrome, email: str, password: str) -> None:
+    """Navigate to login page, fill credentials, wait for cabinet."""
     print(f"Navigating to {LOGIN_URL} ...")
     driver.get(LOGIN_URL)
-    time.sleep(3)   # let page load fully
+    print(f"Waiting {WAIT_SECS}s for page to load (solve CAPTCHA if it appears)...")
+    time.sleep(WAIT_SECS)
 
+    # Already logged in?
+    if "/cabinet" in driver.current_url or "/trade" in driver.current_url:
+        print(f"✓ Already logged in: {driver.current_url}")
+        return
+
+    # Try to fill form
     wait = WebDriverWait(driver, 20)
+    for sel in ['input[name="email"]', 'input[type="email"]', '#email']:
+        try:
+            f = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
+            f.clear(); f.send_keys(email)
+            print("✓ Email filled")
+            break
+        except TimeoutException:
+            continue
 
-    # Fill email
-    try:
-        email_field = wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="email"]'))
-        )
-        email_field.clear()
-        email_field.send_keys(email)
-        print("✓ Email filled")
-    except TimeoutException:
-        raise RuntimeError("Could not find email field — page structure may have changed")
+    for sel in ['input[name="password"]', 'input[type="password"]', '#password']:
+        try:
+            f = driver.find_element(By.CSS_SELECTOR, sel)
+            f.clear(); f.send_keys(password)
+            print("✓ Password filled")
+            break
+        except NoSuchElementException:
+            continue
 
-    # Fill password
-    try:
-        pw_field = driver.find_element(By.CSS_SELECTOR, 'input[name="password"]')
-        pw_field.clear()
-        pw_field.send_keys(password)
-        print("✓ Password filled")
-    except NoSuchElementException:
-        raise RuntimeError("Could not find password field")
+    for sel in ['button[type="submit"]', 'input[type="submit"]', 'form button']:
+        try:
+            driver.find_element(By.CSS_SELECTOR, sel).click()
+            print("✓ Login button clicked")
+            break
+        except NoSuchElementException:
+            continue
 
-    # Click login button
-    try:
-        # Try multiple selectors for the submit button
-        for selector in [
-            'button[type="submit"]',
-            'input[type="submit"]',
-            '.btn-login',
-            'button.btn',
-        ]:
-            try:
-                btn = driver.find_element(By.CSS_SELECTOR, selector)
-                btn.click()
-                print("✓ Login button clicked")
-                break
-            except NoSuchElementException:
-                continue
-        else:
-            # Fallback: submit the form via JS
-            driver.execute_script(
-                "document.querySelector('form').submit();"
-            )
-            print("✓ Form submitted via JS")
-    except Exception as exc:
-        raise RuntimeError(f"Could not click login button: {exc}")
-
-
-def wait_for_login(driver: uc.Chrome, captcha_wait: int = CAPTCHA_WAIT) -> None:
-    """
-    Wait for login to complete.
-    The browser window stays open so you can solve CAPTCHA manually.
-    """
-    print(f"\n{'='*50}")
-    print("BROWSER IS OPEN — solve the CAPTCHA if one appears.")
-    print(f"Waiting up to {captcha_wait}s for you to complete login...")
-    print(f"{'='*50}\n")
-
-    deadline = time.time() + captcha_wait + WAIT_TIMEOUT
+    # Wait for redirect to cabinet
+    print("Waiting for login redirect...")
+    deadline = time.time() + 90
     while time.time() < deadline:
-        current_url = driver.current_url
-        # Success: redirected to cabinet
-        if "/cabinet" in current_url or "/trade" in current_url:
-            print(f"✓ Login successful! URL: {current_url}")
+        if "/cabinet" in driver.current_url or "/trade" in driver.current_url:
+            print(f"✓ Logged in: {driver.current_url}")
             return
-        # Still on login page — waiting
         time.sleep(2)
 
-    raise RuntimeError(
-        f"Login did not complete within {captcha_wait + WAIT_TIMEOUT}s.\n"
-        "Make sure you solved the CAPTCHA and the credentials are correct."
-    )
+    raise RuntimeError(f"Login did not complete. Current URL: {driver.current_url}")
 
 
-def extract_ssid(driver: uc.Chrome) -> tuple[str, int | None]:
+def extract_ssid_from_websocket(driver: uc.Chrome) -> tuple[str | None, int | None]:
     """
-    Extract the SSID cookie and UID from the browser.
-
-    Returns (ssid_value, uid) where:
-      ssid_value  — the raw session cookie value
-      uid         — integer UID or None if not found
+    Navigate to the trading page and intercept the WebSocket auth message.
+    This captures the correct short session token, not the HTTP cookie.
     """
-    print("Extracting SSID cookie...")
+    print("Injecting WebSocket interceptor...")
 
-    # Give the page a moment to set all cookies
-    time.sleep(3)
+    # Inject before navigating to trading page
+    driver.execute_script("""
+        window._po_ssid = null;
+        window._po_uid  = null;
+        const _OrigWS = window.WebSocket;
+        function PatchedWS(url, protocols) {
+            const ws = protocols ? new _OrigWS(url, protocols) : new _OrigWS(url);
+            const _origSend = ws.send.bind(ws);
+            ws.send = function(data) {
+                if (typeof data === 'string' && data.indexOf('"auth"') !== -1) {
+                    try {
+                        var payload = JSON.parse(data.slice(2));
+                        if (Array.isArray(payload) && payload[0] === 'auth' && payload[1]) {
+                            window._po_ssid = payload[1].session || null;
+                            window._po_uid  = payload[1].uid    || null;
+                        }
+                    } catch(e) {}
+                }
+                return _origSend(data);
+            };
+            return ws;
+        }
+        PatchedWS.prototype = _OrigWS.prototype;
+        window.WebSocket = PatchedWS;
+    """)
 
-    cookies = driver.get_cookies()
-    ssid_value = None
-    for cookie in cookies:
-        name = cookie.get("name", "").lower()
-        if name in ("ssid", "session", "po_session"):
-            ssid_value = cookie.get("value", "")
-            print(f"✓ Found cookie '{cookie['name']}': {ssid_value[:20]}...")
-            break
+    print(f"Navigating to trading page to trigger WebSocket auth...")
+    driver.get(TRADE_URL)
 
-    if not ssid_value:
-        # Fallback: try reading from localStorage or sessionStorage
-        try:
-            ssid_value = driver.execute_script(
-                "return localStorage.getItem('ssid') || sessionStorage.getItem('ssid');"
-            )
-            if ssid_value:
-                print(f"✓ Found SSID in storage: {ssid_value[:20]}...")
-        except Exception:
-            pass
+    print("Waiting up to 30s for WebSocket auth message...")
+    for i in range(30):
+        ssid = driver.execute_script("return window._po_ssid;")
+        uid  = driver.execute_script("return window._po_uid;")
+        if ssid:
+            print(f"✓ SSID captured from WebSocket: {str(ssid)[:20]}...")
+            print(f"✓ UID: {uid}")
+            return str(ssid), int(uid) if uid else None
+        time.sleep(1)
+        if i % 5 == 0:
+            print(f"  Still waiting... ({i}s)")
 
-    if not ssid_value:
-        # Last resort: dump all cookies for inspection
-        print("\nAll cookies found:")
-        for c in cookies:
-            print(f"  {c['name']} = {c.get('value','')[:40]}")
-        raise RuntimeError(
-            "Could not find SSID cookie.\n"
-            "The cookie name may be different — check the output above."
-        )
-
-    # Try to extract UID from the page
-    uid = None
-    try:
-        # Many trading platforms expose user data in a global JS variable
-        uid = driver.execute_script(
-            "return window.__USER_ID__ || window.userId || "
-            "(window.user && window.user.id) || null;"
-        )
-        if uid:
-            uid = int(uid)
-            print(f"✓ UID from JS: {uid}")
-    except Exception:
-        pass
-
-    if not uid:
-        # Try extracting from page source
-        try:
-            source = driver.page_source
-            import re
-            match = re.search(r'"uid"\s*:\s*(\d+)', source)
-            if match:
-                uid = int(match.group(1))
-                print(f"✓ UID from page source: {uid}")
-        except Exception:
-            pass
-
-    return ssid_value, uid
+    return None, None
 
 
 def build_auth_string(ssid: str, uid: int | None, is_demo: int = 1) -> str:
-    """
-    Build the full WebSocket authentication string expected by BinaryOptionsToolsV2.
-    Format: 42["auth",{"session":"...","isDemo":1,"uid":123,"platform":1}]
-    """
-    auth_payload = {
+    payload = {
         "session":       ssid,
         "isDemo":        is_demo,
-        "uid":           uid if uid else 0,
+        "uid":           uid or 0,
         "platform":      1,
         "isFastHistory": True,
         "isOptimized":   True,
     }
-    return f'42["auth",{json.dumps(auth_payload, separators=(",", ":"))}]'
+    return f'42["auth",{json.dumps(payload, separators=(",", ":"))}]'
 
-
-# ---------------------------------------------------------------------------
-# Telegram delivery
-# ---------------------------------------------------------------------------
 
 def send_to_telegram(bot_token: str, chat_id: str, auth_string: str) -> bool:
-    """
-    Send the SSID to the bot via /setssid command using the Bot API.
-    Returns True on success.
-    """
     message = f"/setssid {auth_string}"
     url     = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = json.dumps({
-        "chat_id": chat_id,
-        "text":    message,
-    }).encode()
-
+    payload = json.dumps({"chat_id": chat_id, "text": message}).encode()
     try:
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=15) as r:
             resp = json.loads(r.read())
             if resp.get("ok"):
                 print("✓ SSID sent to Telegram bot via /setssid")
                 return True
-            else:
-                print(f"✗ Telegram API error: {resp}")
-                return False
+            print(f"✗ Telegram error: {resp}")
+            return False
     except Exception as exc:
-        print(f"✗ Could not send to Telegram: {exc}")
+        print(f"✗ Telegram send failed: {exc}")
         return False
 
 
-def update_cloudflare_worker(worker_url: str, api_key: str, auth_string: str) -> bool:
-    """
-    Optionally push the new SSID to the Cloudflare Worker relay.
-    Returns True on success.
-    """
+def update_cloudflare_worker(worker_url: str, api_key: str, auth_string: str) -> None:
     if not worker_url or not api_key:
-        return False
+        return
     try:
         payload = json.dumps({"ssid": auth_string}).encode()
         req = urllib.request.Request(
-            f"{worker_url.rstrip('/')}/ssid",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "X-API-Key":    api_key,
-            },
-            method="POST",
+            f"{worker_url.rstrip('/')}/ssid", data=payload,
+            headers={"Content-Type": "application/json", "X-API-Key": api_key},
         )
         with urllib.request.urlopen(req, timeout=10) as r:
-            resp = json.loads(r.read())
-            print(f"✓ Cloudflare Worker updated: {resp.get('status','ok')}")
-            return True
+            print(f"✓ Cloudflare Worker updated: {json.loads(r.read()).get('status','ok')}")
     except Exception as exc:
-        print(f"⚠ Could not update Cloudflare Worker: {exc}")
-        return False
+        print(f"⚠ Cloudflare Worker update failed: {exc}")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     print("=" * 60)
@@ -359,69 +242,61 @@ if __name__ == "__main__":
     print("=" * 60)
 
     config = get_config()
-
     driver = None
+
     try:
-        # 1. Launch browser
         driver = launch_browser()
+        login(driver, config["email"], config["password"])
 
-        # 2. Fill login form
-        fill_login_form(driver, config["email"], config["password"])
+        # Try WebSocket interception first
+        ssid_value, uid = extract_ssid_from_websocket(driver)
 
-        # 3. Wait for login (you solve CAPTCHA here)
-        wait_for_login(driver)
+        if not ssid_value:
+            print("\nWebSocket capture failed. Manual input required.")
+            print("In the Chrome window:")
+            print("  F12 → Network → WS → click connection → Messages")
+            print('  Find 42["auth",... → copy the session value only')
+            ssid_value = input("Paste session value: ").strip()
+            uid_str    = input("Paste UID (numbers): ").strip()
+            uid = int(uid_str) if uid_str.isdigit() else None
 
-        # 4. Extract SSID
-        ssid_value, uid = extract_ssid(driver)
+        if not ssid_value:
+            raise RuntimeError("No SSID obtained.")
 
-        # 5. Build auth string
         auth_string = build_auth_string(ssid_value, uid, config["is_demo"])
 
-        # 6. Print results
         print("\n" + "=" * 60)
         print("SUCCESS!")
-        print(f"SSID value:  {ssid_value[:30]}...")
-        print(f"UID:         {uid}")
-        print(f"Auth string: {auth_string[:60]}...")
+        print(f"Session: {ssid_value[:30]}...")
+        print(f"UID:     {uid}")
+        print(f"Auth:    {auth_string[:70]}...")
         print("=" * 60)
-        print("\nFull auth string (copy this for /setssid):")
+        print("\nFull auth string:")
         print(auth_string)
         print()
 
-        # 7. Send to Telegram bot
         if not config["no_send"] and config["bot_token"] and config["chat_id"]:
-            print("Sending to Telegram bot...")
-            sent = send_to_telegram(
-                config["bot_token"], config["chat_id"], auth_string
-            )
-            if sent:
-                print("✓ Bot will reconnect automatically with the new SSID.")
-            else:
-                print("✗ Telegram send failed. Copy the auth string above and")
-                print("  send it manually: /setssid <auth_string>")
-        else:
-            print("(--no-send flag set or missing bot credentials)")
-            print("Copy the auth string above and send it to your bot:")
-            print(f"  /setssid {auth_string}")
+            send_to_telegram(config["bot_token"], config["chat_id"], auth_string)
 
-        # 8. Optionally update Cloudflare Worker
-        worker_url = os.environ.get("WORKER_URL", "")
-        worker_key = os.environ.get("WORKER_API_KEY", "")
-        if worker_url and worker_key:
-            print("\nUpdating Cloudflare Worker...")
-            update_cloudflare_worker(worker_url, worker_key, auth_string)
+        update_cloudflare_worker(
+            os.environ.get("WORKER_URL", ""),
+            os.environ.get("WORKER_API_KEY", ""),
+            auth_string,
+        )
 
     except RuntimeError as exc:
-        print(f"\n✗ Error: {exc}")
+        print(f"\n✗ {exc}")
         sys.exit(1)
     except KeyboardInterrupt:
-        print("\nCancelled by user.")
-        sys.exit(0)
+        print("\nCancelled.")
     finally:
         if driver:
             try:
-                input("\nPress Enter to close the browser...")
+                input("\nPress Enter to close browser...")
             except EOFError:
                 pass
-            driver.quit()
+            try:
+                driver.quit()
+            except Exception:
+                pass
             print("Browser closed.")
