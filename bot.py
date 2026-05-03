@@ -2508,34 +2508,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     if len(us.all_broadcast_ids()) > 1:
         text += f"Team broadcast: {len(us.all_broadcast_ids())} recipients\n"
-    text += (
-        "\nTap a button below, or use these commands:\n"
-        "/signal \u2014 latest signal\n"
-        "/strategy \u2014 switch between trend / reversal\n"
-        "/adx \u2014 current ADX value + recommended strategy\n"
-        "/autostrategy on|off \u2014 let ADX choose strategy automatically\n"
-        "/scanner on|off \u2014 scan all assets simultaneously\n"
-        "/set_cooldown <s> \u2014 signal cooldown per asset\n"
-        "/recommend \u2014 best assets, windows & strategy from your history\n"
-        "/stats \u2014 your win/loss statistics\n"
-        "/analyze \u2014 detailed trade analytics\n"
-        "/analyze --refresh \u2014 recompute best time window\n"
-        "/autotime on|off \u2014 restrict signals to your best hours\n"
-        "/export \u2014 download your trade log (CSV)\n"
-        "/restrict_window \u2014 only receive signals in your best hours\n"
-        "/clear_restriction \u2014 remove time-window filter\n"
-        "/news \u2014 upcoming high-impact events + filter status\n"
-        "/enable_news_filter \u2014 pause signals before news\n"
-        "/disable_news_filter \u2014 trade through news\n"
-        "/autoon \u2014 enable auto-signals\n"
-        "/autooff \u2014 disable auto-signals\n"
-        "/status \u2014 connection status\n"
-        "/getssid \u2014 show current SSID info\n"
-        "/setssid <string> \u2014 update SSID\n"
-        "/reconnect \u2014 force reconnect\n"
-        "/logs \u2014 recent errors\n"
-        "/debug \u2014 full diagnostics"
-    )
+    text += "\nTap a button below to get started:"
     uid = update.effective_user.id
     if update.message:
         await update.message.reply_text(text, reply_markup=_main_menu_keyboard(uid, us))
