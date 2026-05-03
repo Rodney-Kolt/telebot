@@ -92,6 +92,11 @@ _validation_tasks: dict[str, asyncio.Task] = {}
 # In-flight follow tasks: {signal_id: asyncio.Task}  (prevent duplicates)
 _follow_tasks: dict[str, asyncio.Task] = {}
 
+# Active tracked trades: {chat_id: {trade_id: trade_dict}}
+# trade_dict keys: asset_code, asset_label, direction, entry_price,
+#                  message_id, task, tp_pips, sl_pips, status, ts
+active_trades: dict[int, dict[str, dict]] = {}
+
 PREEMPTIVE_REFRESH_HOURS = 23   # reconnect before the 24-h session boundary
 PING_INTERVAL_SECONDS    = 20   # keep-alive ping cadence
 SIGNAL_EXPIRY_SEC        = 600  # 10 minutes
@@ -1426,6 +1431,86 @@ def _adx_strategy_recommendation(adx: float | None) -> str:
     if adx < 20:
         return "reversal"
     return "trend"       # weak zone — default to trend
+
+
+def calculate_atr(high: list[float], low: list[float],
+                  close: list[float], period: int = 14) -> float | None:
+    """
+    Average True Range — measures market volatility.
+    Returns ATR value or None if insufficient data.
+    Used for TP/SL suggestion and position sizing.
+    """
+    n = len(close)
+    if n < period + 1 or len(high) < n or len(low) < n:
+        return None
+    tr_list = []
+    for i in range(1, n):
+        tr = max(high[i] - low[i],
+                 abs(high[i] - close[i-1]),
+                 abs(low[i]  - close[i-1]))
+        tr_list.append(tr)
+    if len(tr_list) < period:
+        return None
+    # Wilder smoothing
+    atr = sum(tr_list[:period]) / period
+    for tr in tr_list[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return round(atr, 6)
+
+
+def compute_signal_tick(ticks: list[float], window: int = 5) -> dict:
+    """
+    Tick-based micro-window strategy.
+    Uses the last `window` ticks to detect momentum.
+
+    CALL if: last `window` ticks are all rising AND net move > MIN_PRICE_MOVE
+    PUT  if: last `window` ticks are all falling AND net move < -MIN_PRICE_MOVE
+
+    Returns same dict shape as compute_signal_advanced.
+    """
+    result = {
+        "direction":          "WAIT",
+        "confidence":         0,
+        "rsi":                None,
+        "macd":               None,
+        "macd_signal":        None,
+        "histogram":          None,
+        "reason":             "Not enough tick data",
+        "market":             "Tick",
+        "strategy":           "Tick",
+        "effective_strategy": "Tick",
+        "adx":                None,
+    }
+
+    if len(ticks) < window + 1:
+        return result
+
+    recent = ticks[-(window + 1):]
+    moves  = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+    net    = sum(moves)
+
+    all_up   = all(m > 0 for m in moves)
+    all_down = all(m < 0 for m in moves)
+
+    if all_up and net > MIN_PRICE_MOVE:
+        confidence = min(90, 60 + int(net / MIN_PRICE_MOVE * 5))
+        result.update({
+            "direction":  "HIGHER",
+            "confidence": confidence,
+            "reason":     f"Tick: {window} consecutive up moves, net={net:+.5f}",
+        })
+    elif all_down and net < -MIN_PRICE_MOVE:
+        confidence = min(90, 60 + int(abs(net) / MIN_PRICE_MOVE * 5))
+        result.update({
+            "direction":  "LOWER",
+            "confidence": confidence,
+            "reason":     f"Tick: {window} consecutive down moves, net={net:+.5f}",
+        })
+    else:
+        result["reason"] = (
+            f"Tick: mixed moves over {window} ticks, net={net:+.5f}"
+        )
+    return result
 
 
 def compute_signal_bollinger(
@@ -3582,11 +3667,12 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     chosen = args[0].lower()
-    if chosen not in ("trend", "reversal"):
+    if chosen not in ("trend", "reversal", "tick"):
         await update.message.reply_text(
             "❌ Unknown strategy. Choose:\n"
             "  /strategy trend\n"
-            "  /strategy reversal"
+            "  /strategy reversal\n"
+            "  /strategy tick"
         )
         return
 
@@ -3952,6 +4038,507 @@ async def set_cooldown_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Invalid value. Usage: /set_cooldown 120")
 
 
+# ---------------------------------------------------------------------------
+# Trade tracking engine
+# ---------------------------------------------------------------------------
+
+def _pips(price_diff: float, asset_code: str) -> float:
+    """Convert price difference to pips (JPY pairs use 2dp, others 4dp)."""
+    if "JPY" in asset_code.upper():
+        return round(price_diff * 100, 1)
+    return round(price_diff * 10000, 1)
+
+
+def _trade_keyboard(trade_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("❌ Close trade",  callback_data=f"trade:close:{trade_id}"),
+            InlineKeyboardButton("🎯 Set TP/SL",    callback_data=f"trade:tpsl:{trade_id}"),
+        ],
+    ])
+
+
+async def _trade_monitor_task(
+    chat_id: int,
+    trade_id: str,
+    us: "UserSession",
+) -> None:
+    """Background task: edit trade message every 5s with live P&L."""
+    trade = active_trades.get(chat_id, {}).get(trade_id)
+    if not trade:
+        return
+
+    asset_code  = trade["asset_code"]
+    asset_label = trade["asset_label"]
+    direction   = trade["direction"]
+    entry       = trade["entry_price"]
+    message_id  = trade["message_id"]
+    price_hist: list[float] = [entry]
+
+    try:
+        while True:
+            await asyncio.sleep(5)
+
+            # Check if trade was closed
+            trade = active_trades.get(chat_id, {}).get(trade_id)
+            if not trade or trade.get("status") != "active":
+                break
+
+            current = await _get_current_price(us, asset_code)
+            if current is None:
+                continue
+
+            price_hist.append(current)
+            if len(price_hist) > 20:
+                price_hist.pop(0)
+
+            diff  = current - entry
+            pips  = _pips(diff, asset_code)
+            pct   = diff / entry * 100 if entry else 0
+            arrow = "📈" if diff >= 0 else "📉"
+
+            # P&L direction relative to trade direction
+            if direction == "CALL":
+                winning = diff > 0
+            else:
+                winning = diff < 0
+                pips    = -pips
+                pct     = -pct
+
+            pnl_icon = "✅" if winning else "❌"
+
+            # Mini chart (last 10 prices)
+            chart_pts = price_hist[-10:]
+            if len(chart_pts) >= 2:
+                mn, mx = min(chart_pts), max(chart_pts)
+                rng = mx - mn or 1e-10
+                bars = ""
+                for p in chart_pts:
+                    lvl = int((p - mn) / rng * 4)
+                    bars += ["▁","▃","▅","▇","█"][lvl]
+            else:
+                bars = "▬▬▬"
+
+            text = (
+                f"{arrow} {asset_label} | {direction}\n"
+                f"Entry:   {entry:.5f}\n"
+                f"Current: {current:.5f}\n"
+                f"P&L: {pips:+.1f} pips  ({pct:+.3f}%)  {pnl_icon}\n"
+                f"Chart: {bars}\n"
+            )
+
+            # TP/SL check
+            tp = trade.get("tp_pips")
+            sl = trade.get("sl_pips")
+            if tp and abs(pips) >= tp and winning:
+                text += f"\n🎯 TAKE-PROFIT HIT! +{abs(pips):.1f} pips"
+                trade["status"] = "tp_hit"
+                try:
+                    await telegram_app.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id, text=text
+                    )
+                    await telegram_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"✅ **TAKE-PROFIT HIT** on {asset_label}!\nClosed with {pips:+.1f} pips.",
+                    )
+                except Exception:
+                    pass
+                break
+
+            if sl and abs(pips) >= sl and not winning:
+                text += f"\n🛑 STOP-LOSS HIT! {pips:+.1f} pips"
+                trade["status"] = "sl_hit"
+                try:
+                    await telegram_app.bot.edit_message_text(
+                        chat_id=chat_id, message_id=message_id, text=text
+                    )
+                    await telegram_app.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"🛑 **STOP-LOSS HIT** on {asset_label}!\nClosed at {pips:+.1f} pips.",
+                    )
+                except Exception:
+                    pass
+                break
+
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    reply_markup=_trade_keyboard(trade_id),
+                )
+            except Exception:
+                pass
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        log_error(f"_trade_monitor_task error: {exc}")
+    finally:
+        # Mark closed if still active
+        trade = active_trades.get(chat_id, {}).get(trade_id)
+        if trade and trade.get("status") == "active":
+            trade["status"] = "closed"
+
+
+@_require_auth
+async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start monitoring a trade with live P&L updates.
+
+    Usage: /track <asset_code> <entry_price> <CALL|PUT>
+    Example: /track EURUSD_otc 1.12345 CALL
+    """
+    chat_id = update.effective_chat.id
+    us      = _get_user_session(chat_id)
+
+    args = context.args or []
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage: /track <asset> <entry_price> <CALL|PUT>\n"
+            "Example: /track EURUSD_otc 1.12345 CALL\n\n"
+            "Or tap 🔍 Follow price on any signal message."
+        )
+        return
+
+    asset_code = args[0].strip()
+    try:
+        entry_price = float(args[1])
+    except ValueError:
+        await update.message.reply_text("Invalid entry price.")
+        return
+
+    direction = args[2].upper()
+    if direction not in ("CALL", "PUT"):
+        await update.message.reply_text("Direction must be CALL or PUT.")
+        return
+
+    asset_label = _get_display_label(asset_code)
+    trade_id    = f"{chat_id}_{int(time.time())}"
+
+    sent = await update.message.reply_text(
+        f"📡 Tracking {asset_label} | {direction}\n"
+        f"Entry: {entry_price:.5f}\n"
+        "Fetching live price...",
+        reply_markup=_trade_keyboard(trade_id),
+    )
+
+    if chat_id not in active_trades:
+        active_trades[chat_id] = {}
+
+    active_trades[chat_id][trade_id] = {
+        "asset_code":  asset_code,
+        "asset_label": asset_label,
+        "direction":   direction,
+        "entry_price": entry_price,
+        "message_id":  sent.message_id,
+        "status":      "active",
+        "tp_pips":     None,
+        "sl_pips":     None,
+        "ts":          time.time(),
+    }
+
+    task = asyncio.create_task(
+        _trade_monitor_task(chat_id, trade_id, us),
+        name=f"track_{trade_id}",
+    )
+    active_trades[chat_id][trade_id]["task"] = task
+
+
+@_require_auth
+async def close_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stop tracking the most recent active trade."""
+    chat_id = update.effective_chat.id
+    trades  = active_trades.get(chat_id, {})
+    active  = {tid: t for tid, t in trades.items() if t.get("status") == "active"}
+
+    if not active:
+        await update.message.reply_text("No active tracked trades.")
+        return
+
+    # Close the most recent
+    trade_id = max(active, key=lambda tid: active[tid]["ts"])
+    trade    = active[trade_id]
+    trade["status"] = "closed"
+
+    task = trade.get("task")
+    if task and not task.done():
+        task.cancel()
+
+    current = await _get_current_price(
+        _get_user_session(chat_id), trade["asset_code"]
+    )
+    if current:
+        diff  = current - trade["entry_price"]
+        pips  = _pips(diff, trade["asset_code"])
+        if trade["direction"] == "PUT":
+            pips = -pips
+        result = "win" if pips > 0 else "loss"
+        _log_trade(chat_id, {
+            "asset_label": trade["asset_label"],
+            "tf_label":    "manual",
+            "direction":   trade["direction"],
+            "confidence":  "",
+            "rsi":         "",
+            "price":       str(trade["entry_price"]),
+            "market":      "",
+            "reason":      f"Manual track closed at {current:.5f}",
+        }, result)
+        await update.message.reply_text(
+            f"✅ Trade closed: {trade['asset_label']} {trade['direction']}\n"
+            f"Entry: {trade['entry_price']:.5f}\n"
+            f"Exit:  {current:.5f}\n"
+            f"P&L: {pips:+.1f} pips  ({'WIN' if pips > 0 else 'LOSS'})"
+        )
+    else:
+        await update.message.reply_text(f"Trade {trade['asset_label']} closed.")
+
+
+@_require_auth
+async def set_tp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set take-profit in pips for the active trade. Usage: /set_tp 5"""
+    chat_id = update.effective_chat.id
+    trades  = active_trades.get(chat_id, {})
+    active  = {tid: t for tid, t in trades.items() if t.get("status") == "active"}
+
+    if not active:
+        await update.message.reply_text("No active tracked trades.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /set_tp <pips>  e.g. /set_tp 5")
+        return
+
+    try:
+        tp = float(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid pips value.")
+        return
+
+    trade_id = max(active, key=lambda tid: active[tid]["ts"])
+    active[trade_id]["tp_pips"] = tp
+    await update.message.reply_text(
+        f"🎯 Take-profit set at {tp} pips for {active[trade_id]['asset_label']}."
+    )
+
+
+@_require_auth
+async def set_sl_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set stop-loss in pips for the active trade. Usage: /set_sl 3"""
+    chat_id = update.effective_chat.id
+    trades  = active_trades.get(chat_id, {})
+    active  = {tid: t for tid, t in trades.items() if t.get("status") == "active"}
+
+    if not active:
+        await update.message.reply_text("No active tracked trades.")
+        return
+
+    args = context.args or []
+    if not args:
+        await update.message.reply_text("Usage: /set_sl <pips>  e.g. /set_sl 3")
+        return
+
+    try:
+        sl = float(args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid pips value.")
+        return
+
+    trade_id = max(active, key=lambda tid: active[tid]["ts"])
+    active[trade_id]["sl_pips"] = sl
+    await update.message.reply_text(
+        f"🛑 Stop-loss set at {sl} pips for {active[trade_id]['asset_label']}."
+    )
+
+
+@_require_auth
+async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show live Pocket Option account balance and session info."""
+    chat_id = update.effective_chat.id
+    us      = _get_user_session(chat_id)
+    sm      = us.session_manager if us else None
+
+    if not (sm and sm.is_connected and sm.client):
+        await update.message.reply_text(
+            "Not connected to Pocket Option.\n"
+            "Use /reconnect or /setssid to connect."
+        )
+        return
+
+    await update.message.reply_text("⏳ Fetching account info...")
+    try:
+        balance = await sm.client.balance()
+        is_demo = sm.is_demo
+        uid_str = _parse_uid_from_ssid(us.ssid) or "unknown"
+
+        # Try server time for sync info
+        try:
+            server_ts  = await sm.client.get_server_time()
+            server_dt  = datetime.utcfromtimestamp(server_ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+        except Exception:
+            server_dt = "unavailable"
+
+        connected_since = (
+            sm.connected_at.strftime("%Y-%m-%d %H:%M:%S")
+            if sm.connected_at else "unknown"
+        )
+
+        await update.message.reply_text(
+            f"💰 Pocket Option Account\n\n"
+            f"Account type: {'Demo 🎮' if is_demo else 'Real 💵'}\n"
+            f"Balance: ${balance:.2f}\n"
+            f"UID: {uid_str}\n\n"
+            f"Connection: 🟢 Live\n"
+            f"Connected since: {connected_since}\n"
+            f"Server time: {server_dt}\n\n"
+            f"📊 Paper trading balance: ${float(_get_user_settings(chat_id).get('paper_balance', PAPER_START_BALANCE)):.2f}\n\n"
+            "Note: Today's P&L is not available via the API.\n"
+            "Use /paper for paper trading stats, /analyze for signal history."
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"Could not fetch account info: {exc}")
+
+
+@_require_auth
+async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show all active tracked trades and paper balance."""
+    chat_id = update.effective_chat.id
+    trades  = active_trades.get(chat_id, {})
+    active  = {tid: t for tid, t in trades.items() if t.get("status") == "active"}
+    ps      = _get_user_settings(chat_id)
+    balance = float(ps.get("paper_balance", PAPER_START_BALANCE))
+    us      = _get_user_session(chat_id)
+
+    lines = ["📊 Dashboard\n"]
+
+    if active:
+        lines.append(f"Active trades: {len(active)}")
+        for tid, t in active.items():
+            current = await _get_current_price(us, t["asset_code"])
+            if current:
+                diff = current - t["entry_price"]
+                pips = _pips(diff, t["asset_code"])
+                if t["direction"] == "PUT":
+                    pips = -pips
+                icon = "✅" if pips > 0 else "❌"
+                lines.append(
+                    f"  {icon} {t['asset_label']} {t['direction']} "
+                    f"| {pips:+.1f} pips"
+                )
+                tp = t.get("tp_pips")
+                sl = t.get("sl_pips")
+                if tp or sl:
+                    lines.append(f"     TP: {tp or '—'} pips  SL: {sl or '—'} pips")
+    else:
+        lines.append("No active trades.")
+
+    lines.append(f"\n💰 Paper balance: ${balance:.2f}")
+
+    paper_rows = _read_paper_trades(chat_id)
+    if paper_rows:
+        total = len(paper_rows)
+        wins  = sum(1 for r in paper_rows if r.get("result") == "win")
+        pnl   = sum(float(r.get("pnl", 0)) for r in paper_rows)
+        lines.append(f"Paper trades: {total}  Win rate: {wins/total*100:.0f}%  P&L: {pnl:+.2f}$")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+@_require_auth
+async def suggestion_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Suggest entry, TP, and SL levels based on ATR for the current asset."""
+    chat_id = update.effective_chat.id
+    us      = _get_user_session(chat_id)
+    ps      = _get_user_settings(chat_id)
+    asset_label = ps.get("asset", DEFAULT_SETTINGS["asset"])
+    asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
+    tf_seconds  = TIMEFRAMES.get(ps.get("timeframe", "1 minute"), 60)
+
+    sm = us.session_manager if us else None
+    if not (sm and sm.is_connected):
+        await update.message.reply_text("Not connected to Pocket Option.")
+        return
+
+    await update.message.reply_text(f"⏳ Calculating ATR suggestion for {asset_label}...")
+    try:
+        candles = await sm.get_candles(asset=asset_code, timeframe=tf_seconds, count=CANDLE_COUNT)
+        if not candles or len(candles) < 16:
+            await update.message.reply_text("Not enough data.")
+            return
+
+        highs  = [float(c["high"]  if isinstance(c, dict) else c.high)  for c in candles]
+        lows   = [float(c["low"]   if isinstance(c, dict) else c.low)   for c in candles]
+        closes = _closes(candles)
+        current = closes[-1]
+
+        atr = calculate_atr(highs, lows, closes)
+        if atr is None:
+            await update.message.reply_text("Could not compute ATR.")
+            return
+
+        atr_pips = _pips(atr, asset_code)
+        tp_pips  = round(atr_pips * 1.5, 1)   # 1.5× ATR for TP
+        sl_pips  = round(atr_pips * 1.0, 1)   # 1× ATR for SL
+
+        # Get signal direction for context
+        result = compute_signal_advanced(candles, tf_seconds)
+        direction = result.get("direction", "WAIT")
+        dir_str   = "CALL 📈" if direction == "HIGHER" else "PUT 📉" if direction == "LOWER" else "WAIT ⏸"
+
+        await update.message.reply_text(
+            f"💡 ATR Suggestion — {asset_label}\n\n"
+            f"Current price: {current:.5f}\n"
+            f"ATR (14): {atr:.5f}  ({atr_pips:.1f} pips)\n\n"
+            f"Signal: {dir_str}\n\n"
+            f"Suggested levels:\n"
+            f"  Entry: {current:.5f}\n"
+            f"  Take-profit: {tp_pips:.1f} pips  ({current + atr*1.5:.5f})\n"
+            f"  Stop-loss:   {sl_pips:.1f} pips  ({current - atr:.5f})\n\n"
+            f"Use /track {asset_code} {current:.5f} CALL to start monitoring."
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"Suggestion error: {exc}")
+
+
+async def trade_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline buttons on tracked trade messages."""
+    query = update.callback_query
+    await query.answer()
+    data    = query.data   # "trade:close:<trade_id>" or "trade:tpsl:<trade_id>"
+    parts   = data.split(":", 2)
+    if len(parts) != 3:
+        return
+
+    _, action, trade_id = parts
+    chat_id = query.message.chat.id
+    trades  = active_trades.get(chat_id, {})
+    trade   = trades.get(trade_id)
+
+    if not trade:
+        await query.answer("Trade not found or already closed.")
+        return
+
+    if action == "close":
+        trade["status"] = "closed"
+        task = trade.get("task")
+        if task and not task.done():
+            task.cancel()
+        await query.edit_message_text(
+            query.message.text + "\n\n✅ Trade closed manually.",
+        )
+
+    elif action == "tpsl":
+        await query.answer()
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"Set TP/SL for {trade['asset_label']}:\n"
+                f"  /set_tp <pips>  — e.g. /set_tp 5\n"
+                f"  /set_sl <pips>  — e.g. /set_sl 3"
+            ),
+        )
+
+
 @_require_auth
 async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show paper trading virtual balance and stats."""
@@ -4135,9 +4722,10 @@ conv_handler = ConversationHandler(
 )
 
 # Vote and follow handlers registered BEFORE conv_handler so they take priority
-telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler, pattern="^vote:noop$"))
-telegram_app.add_handler(CallbackQueryHandler(vote_handler,      pattern="^vote:(win|loss):"))
-telegram_app.add_handler(CallbackQueryHandler(follow_handler,    pattern="^follow:"))
+telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler,     pattern="^vote:noop$"))
+telegram_app.add_handler(CallbackQueryHandler(vote_handler,          pattern="^vote:(win|loss):"))
+telegram_app.add_handler(CallbackQueryHandler(follow_handler,        pattern="^follow:"))
+telegram_app.add_handler(CallbackQueryHandler(trade_callback_handler, pattern="^trade:"))
 telegram_app.add_handler(conv_handler)
 telegram_app.add_handler(CommandHandler("signal",             signal_command))
 telegram_app.add_handler(CommandHandler("stats",              stats_command))
@@ -4156,6 +4744,13 @@ telegram_app.add_handler(CommandHandler("autostrategy",       autostrategy_comma
 telegram_app.add_handler(CommandHandler("recommend",          recommend_command))
 telegram_app.add_handler(CommandHandler("scanner",            scanner_command))
 telegram_app.add_handler(CommandHandler("set_cooldown",       set_cooldown_command))
+telegram_app.add_handler(CommandHandler("track",              track_command))
+telegram_app.add_handler(CommandHandler("close",              close_command))
+telegram_app.add_handler(CommandHandler("set_tp",             set_tp_command))
+telegram_app.add_handler(CommandHandler("set_sl",             set_sl_command))
+telegram_app.add_handler(CommandHandler("dashboard",          dashboard_command))
+telegram_app.add_handler(CommandHandler("suggestion",         suggestion_command))
+telegram_app.add_handler(CommandHandler("account",            account_command))
 telegram_app.add_handler(CommandHandler("restrict_window",    restrict_window_command))
 telegram_app.add_handler(CommandHandler("clear_restriction",  clear_restriction_command))
 telegram_app.add_handler(CommandHandler("enable_news_filter",  enable_news_filter_command))
