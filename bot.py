@@ -2501,17 +2501,24 @@ async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """
     us = _get_user_session(update.effective_chat.id)
 
-    if not context.args:
+    # Parse args from context.args OR directly from message text (fallback)
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1:
+            args = parts[1:]
+
+    if not args:
         current = _get_user_settings(update.effective_chat.id).get("strategy", "trend")
         await update.message.reply_text(
             f"📊 Current strategy: {current}\n\n"
-            "Available strategies:\n"
-            "  /strategy trend    — MACD+RSI (requires RSI extreme + MACD confirmation)\n"
-            "  /strategy reversal — Bollinger Bands reversal (price bouncing off bands)"
+            "To switch, send:\n"
+            "  /strategy trend\n"
+            "  /strategy reversal"
         )
         return
 
-    chosen = context.args[0].lower()
+    chosen = args[0].lower()
     if chosen not in ("trend", "reversal"):
         await update.message.reply_text(
             "❌ Unknown strategy. Choose:\n"
