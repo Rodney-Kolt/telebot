@@ -48,6 +48,12 @@ SIGNAL_IMG_BUY  = os.environ.get("SIGNAL_IMG_BUY",  "").strip() or _DEFAULT_IMG_
 SIGNAL_IMG_SELL = os.environ.get("SIGNAL_IMG_SELL", "").strip() or _DEFAULT_IMG_SELL
 
 # ---------------------------------------------------------------------------
+# Cloudflare Worker SSID relay (optional — set WORKER_URL + WORKER_API_KEY)
+# ---------------------------------------------------------------------------
+WORKER_URL     = os.environ.get("WORKER_URL",     "").rstrip("/")
+WORKER_API_KEY = os.environ.get("WORKER_API_KEY", "")
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 TRADE_ASSET   = "EURUSD_otc"
@@ -75,6 +81,108 @@ SCAN_ASSETS: list[str] = _load_scan_assets()
 
 # Default cooldown between signals for the same asset (seconds)
 DEFAULT_COOLDOWN_SECONDS = 120
+
+# ---------------------------------------------------------------------------
+# Cloudflare Worker SSID relay helpers
+# ---------------------------------------------------------------------------
+
+async def fetch_ssid_from_worker() -> str | None:
+    """
+    Fetch the current SSID from the Cloudflare Worker relay.
+    Returns the SSID string or None if unavailable/not configured.
+    """
+    if not WORKER_URL or not WORKER_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"{WORKER_URL}/ssid",
+                headers={"X-API-Key": WORKER_API_KEY},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                ssid = data.get("ssid", "")
+                if ssid:
+                    logger.info(f"SSID fetched from Worker (uid={data.get('uid')})")
+                    return ssid
+            else:
+                logger.warning(f"Worker returned {r.status_code}: {r.text[:200]}")
+    except Exception as exc:
+        logger.warning(f"fetch_ssid_from_worker error: {exc}")
+    return None
+
+
+async def push_ssid_to_worker(ssid: str) -> bool:
+    """
+    Push a new SSID to the Worker (for record-keeping).
+    Returns True on success.
+    """
+    if not WORKER_URL or not WORKER_API_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                f"{WORKER_URL}/ssid",
+                headers={"X-API-Key": WORKER_API_KEY, "Content-Type": "application/json"},
+                json={"ssid": ssid},
+            )
+            return r.status_code == 200
+    except Exception as exc:
+        logger.warning(f"push_ssid_to_worker error: {exc}")
+        return False
+
+
+async def _worker_refresh_loop() -> None:
+    """
+    Background task: every 23 hours, fetch a fresh SSID from the Worker
+    and apply it to all active user sessions.
+    Falls back to Telegram alert if Worker is unavailable.
+    """
+    INTERVAL = PREEMPTIVE_REFRESH_HOURS * 3600
+    logger.info(f"Worker refresh loop started (interval={PREEMPTIVE_REFRESH_HOURS}h)")
+
+    while True:
+        await asyncio.sleep(INTERVAL)
+
+        if not WORKER_URL:
+            continue   # Worker not configured — SessionManager handles its own refresh
+
+        logger.info("Worker refresh loop: fetching fresh SSID...")
+        new_ssid = await fetch_ssid_from_worker()
+
+        if not new_ssid:
+            # Worker failed — notify all users
+            msg = (
+                "⚠️ SSID Worker unreachable during scheduled refresh.\n\n"
+                "Your session may expire soon. To refresh manually:\n"
+                "1. Open pocketoption.com → log in\n"
+                "2. F12 → Network → WS → copy 42[\"auth\",...]\n"
+                "3. Send: /setssid <paste>\n\n"
+                "Then update the Worker secret:\n"
+                "wrangler secret put SSID"
+            )
+            for us in set(user_registry.values()):
+                try:
+                    await telegram_app.bot.send_message(chat_id=us.chat_id, text=msg)
+                except Exception:
+                    pass
+            continue
+
+        # Apply new SSID to all sessions
+        updated = 0
+        for us in set(user_registry.values()):
+            if us.ssid != new_ssid:
+                us.ssid = new_ssid
+                if us.session_manager:
+                    us.session_manager.ssid = new_ssid
+                    async with us.session_manager._lock:
+                        success = await us.session_manager._connect()
+                    if success:
+                        updated += 1
+                        logger.info(f"[{us.name}] SSID refreshed from Worker")
+
+        if updated:
+            logger.info(f"Worker refresh: updated {updated} session(s)")
 
 # ---------------------------------------------------------------------------
 # Signal validation & paper trading constants
@@ -3388,6 +3496,14 @@ async def setssid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"UID: {uid_str or 'N/A'}\n\n"
                 "Also update the SSID env var on Render so it survives a restart."
             )
+            # Push to Worker relay if configured
+            if WORKER_URL and WORKER_API_KEY:
+                pushed = await push_ssid_to_worker(new_ssid)
+                if pushed:
+                    await update.message.reply_text(
+                        "✅ SSID also pushed to Cloudflare Worker relay.\n"
+                        "Remember to run: wrangler secret put SSID"
+                    )
         else:
             await update.message.reply_text(
                 "\u274c Reconnect failed \u2014 the SSID may be invalid or already expired.\n"
@@ -4963,6 +5079,14 @@ async def lifespan(app: Starlette):
     _load_stats()
     _load_user_persistent_settings()
 
+    # Fetch SSID from Cloudflare Worker if configured (overrides env var)
+    worker_ssid = await fetch_ssid_from_worker()
+    if worker_ssid:
+        logger.info("Using SSID from Cloudflare Worker relay")
+        # Patch the module-level SSID used by _load_user_configs fallback
+        import sys
+        sys.modules[__name__].__dict__["SSID"] = worker_ssid
+
     # Pre-fetch economic calendar
     await _refresh_calendar()
 
@@ -5010,6 +5134,12 @@ async def lifespan(app: Starlette):
                 user_registry[extra_id] = us
                 logger.info(f"  Registered broadcast recipient {extra_id} → [{us.name}]")
 
+    # Start Cloudflare Worker SSID refresh loop (only if Worker is configured)
+    worker_task = None
+    if WORKER_URL and WORKER_API_KEY:
+        worker_task = asyncio.create_task(_worker_refresh_loop(), name="worker_refresh")
+        logger.info(f"Worker refresh loop started (URL: {WORKER_URL})")
+
     yield  # ── server is running ──────────────────────────────────────────
 
     # Shutdown all user sessions
@@ -5029,6 +5159,9 @@ async def lifespan(app: Starlette):
                 t.cancel()
         if us.session_manager:
             await us.session_manager.stop()
+
+    if worker_task and not worker_task.done():
+        worker_task.cancel()
 
     await telegram_app.stop()
     await telegram_app.shutdown()

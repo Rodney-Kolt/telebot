@@ -1,0 +1,9 @@
+name = "pocket-option-ssid-relay"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Secrets (set via: wrangler secret put <NAME>)
+# SSID          – the full 42["auth",{...}] string from your browser
+# API_KEY       – a random secret string your bot uses to authenticate
+# CHAT_ID       – your Telegram chat ID (for expiry notifications)
+# BOT_TOKEN     – your Telegram bot token (for expiry notifications)
