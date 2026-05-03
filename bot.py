@@ -76,6 +76,22 @@ SCAN_ASSETS: list[str] = _load_scan_assets()
 # Default cooldown between signals for the same asset (seconds)
 DEFAULT_COOLDOWN_SECONDS = 120
 
+# ---------------------------------------------------------------------------
+# Signal validation & paper trading constants
+# ---------------------------------------------------------------------------
+VALIDATION_SECONDS   = 60      # seconds after signal to auto-validate
+PAPER_STAKE          = 1.0     # default stake per paper trade ($)
+PAPER_PAYOUT         = 0.85    # payout ratio on win (85%)
+PAPER_START_BALANCE  = 1000.0  # starting virtual balance
+MIN_PRICE_MOVE       = 0.0001  # minimum move to count as win (forex OTC)
+FOLLOW_INTERVAL_SEC  = 5       # price update interval when following
+FOLLOW_DURATION_SEC  = 60      # total follow duration
+
+# In-flight validation tasks: {signal_id: asyncio.Task}
+_validation_tasks: dict[str, asyncio.Task] = {}
+# In-flight follow tasks: {signal_id: asyncio.Task}  (prevent duplicates)
+_follow_tasks: dict[str, asyncio.Task] = {}
+
 PREEMPTIVE_REFRESH_HOURS = 23   # reconnect before the 24-h session boundary
 PING_INTERVAL_SECONDS    = 20   # keep-alive ping cadence
 SIGNAL_EXPIRY_SEC        = 600  # 10 minutes
@@ -389,8 +405,11 @@ def _get_user_persistent(chat_id: int) -> dict:
     ps.setdefault("asset",         "EUR/USD (OTC)")
     ps.setdefault("timeframe",     "1 minute")
     ps.setdefault("auto_strategy", True)
-    ps.setdefault("scanner",       False)   # multi-asset scanner ON/OFF
+    ps.setdefault("scanner",       False)
     ps.setdefault("cooldown",      DEFAULT_COOLDOWN_SECONDS)
+    ps.setdefault("auto_validate", True)          # auto signal validation
+    ps.setdefault("paper_balance", PAPER_START_BALANCE)
+    ps.setdefault("paper_stake",   PAPER_STAKE)
     return ps
 
 
@@ -554,8 +573,285 @@ def _read_trades(chat_id: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Analytics helpers
+# Paper trading & signal validation helpers
 # ---------------------------------------------------------------------------
+
+_PAPER_HEADERS     = ["timestamp", "asset", "direction", "stake",
+                       "entry_price", "exit_price", "result", "pnl", "balance_after"]
+_VALIDATION_HEADERS = ["timestamp", "asset", "direction", "entry_price",
+                        "exit_price", "result", "validated_at"]
+
+
+def _paper_path(chat_id: int) -> str:
+    return os.path.join(_BASE_DIR, f"paper_{chat_id}.csv")
+
+
+def _validation_path(chat_id: int) -> str:
+    return os.path.join(_BASE_DIR, f"validation_{chat_id}.csv")
+
+
+def _log_paper_trade(chat_id: int, asset: str, direction: str, stake: float,
+                     entry_price: float, exit_price: float,
+                     result: str, balance_after: float) -> None:
+    path = _paper_path(chat_id)
+    write_header = not os.path.exists(path)
+    pnl = stake * PAPER_PAYOUT if result == "win" else -stake
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_PAPER_HEADERS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp":    datetime.utcnow().isoformat(timespec="seconds"),
+                "asset":        asset,
+                "direction":    direction,
+                "stake":        f"{stake:.2f}",
+                "entry_price":  f"{entry_price:.5f}",
+                "exit_price":   f"{exit_price:.5f}",
+                "result":       result,
+                "pnl":          f"{pnl:+.2f}",
+                "balance_after": f"{balance_after:.2f}",
+            })
+    except Exception as exc:
+        logger.warning(f"Could not write paper trade for {chat_id}: {exc}")
+
+
+def _log_validation(chat_id: int, asset: str, direction: str,
+                    entry_price: float, exit_price: float, result: str) -> None:
+    path = _validation_path(chat_id)
+    write_header = not os.path.exists(path)
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=_VALIDATION_HEADERS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "timestamp":    datetime.utcnow().isoformat(timespec="seconds"),
+                "asset":        asset,
+                "direction":    direction,
+                "entry_price":  f"{entry_price:.5f}",
+                "exit_price":   f"{exit_price:.5f}",
+                "result":       result,
+                "validated_at": datetime.utcnow().strftime("%H:%M:%S"),
+            })
+    except Exception as exc:
+        logger.warning(f"Could not write validation for {chat_id}: {exc}")
+
+
+def _read_paper_trades(chat_id: int) -> list[dict]:
+    path = _paper_path(chat_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+def _read_validations(chat_id: int) -> list[dict]:
+    path = _validation_path(chat_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+    except Exception:
+        return []
+
+
+async def _get_current_price(us: "UserSession", asset_code: str) -> float | None:
+    """Fetch the most recent close price for an asset."""
+    sm = us.session_manager if us else None
+    if not (sm and sm.is_connected):
+        return None
+    try:
+        candles = await sm.get_candles(asset=asset_code, timeframe=60, count=2)
+        if candles:
+            c = candles[-1]
+            return float(c["close"] if isinstance(c, dict) else c.close)
+    except Exception:
+        pass
+    return None
+
+
+def _ascii_candle(price_changes: list[float]) -> str:
+    """Return a simple ASCII candle bar based on recent price changes."""
+    if not price_changes:
+        return "▬▬▬"
+    net = sum(price_changes)
+    if net > 0:
+        strength = min(3, int(abs(net) / 0.00005) + 1)
+        return "\U0001f7e9" + "█" * strength + "▬" * (3 - strength)
+    elif net < 0:
+        strength = min(3, int(abs(net) / 0.00005) + 1)
+        return "\U0001f7e5" + "█" * strength + "▬" * (3 - strength)
+    return "⬜▬▬▬"
+
+
+async def _validate_signal(
+    signal_id: str,
+    chat_id: int,
+    us: "UserSession",
+    asset_code: str,
+    asset_label: str,
+    direction: str,
+    entry_price: float,
+    delay_secs: int = VALIDATION_SECONDS,
+) -> None:
+    """
+    Wait delay_secs, then fetch price and auto-validate the signal.
+    Updates paper balance and logs to validation CSV.
+    """
+    try:
+        await asyncio.sleep(delay_secs)
+
+        exit_price = await _get_current_price(us, asset_code)
+        if exit_price is None:
+            logger.warning(f"Validation: could not fetch price for {asset_code}")
+            return
+
+        move = exit_price - entry_price
+        if direction == "CALL":
+            result = "win" if move > MIN_PRICE_MOVE else "loss"
+        else:
+            result = "win" if move < -MIN_PRICE_MOVE else "loss"
+
+        ps = _get_user_settings(chat_id)
+        if not ps.get("auto_validate", True):
+            return
+
+        # Log validation
+        _log_validation(chat_id, asset_label, direction, entry_price, exit_price, result)
+
+        # Paper trading update
+        stake   = float(ps.get("paper_stake", PAPER_STAKE))
+        balance = float(ps.get("paper_balance", PAPER_START_BALANCE))
+        pnl     = stake * PAPER_PAYOUT if result == "win" else -stake
+        balance += pnl
+        ps["paper_balance"] = round(balance, 2)
+        _save_user_persistent_settings()
+        _log_paper_trade(chat_id, asset_label, direction, stake,
+                         entry_price, exit_price, result, balance)
+
+        # Notify user
+        icon = "✅ WIN" if result == "win" else "❌ LOSS"
+        move_str = f"{move:+.5f}"
+        try:
+            await telegram_app.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🔍 Signal Validated ({delay_secs}s)\n\n"
+                    f"Asset: {asset_label}\n"
+                    f"Direction: {direction}\n"
+                    f"Entry: {entry_price:.5f}\n"
+                    f"Exit:  {exit_price:.5f}  ({move_str})\n"
+                    f"Result: {icon}\n\n"
+                    f"📊 Paper: {'+' if pnl >= 0 else ''}{pnl:.2f}$  "
+                    f"Balance: {balance:.2f}$"
+                ),
+            )
+        except Exception as exc:
+            logger.warning(f"Validation notify error: {exc}")
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        log_error(f"_validate_signal error: {exc}")
+    finally:
+        _validation_tasks.pop(signal_id, None)
+
+
+async def _follow_price_task(
+    signal_id: str,
+    chat_id: int,
+    message_id: int,
+    us: "UserSession",
+    asset_code: str,
+    asset_label: str,
+    direction: str,
+    entry_price: float,
+    duration: int = FOLLOW_DURATION_SEC,
+    interval: int = FOLLOW_INTERVAL_SEC,
+) -> None:
+    """
+    Edit the signal message every `interval` seconds with live price updates.
+    Shows ASCII candle, price change, and countdown.
+    """
+    try:
+        price_history: list[float] = [entry_price]
+        elapsed = 0
+
+        while elapsed < duration:
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+            current = await _get_current_price(us, asset_code)
+            if current is None:
+                continue
+
+            price_history.append(current)
+            if len(price_history) > 6:
+                price_history.pop(0)
+
+            changes = [price_history[i] - price_history[i-1]
+                       for i in range(1, len(price_history))]
+            candle  = _ascii_candle(changes)
+            move    = current - entry_price
+            move_pct = move / entry_price * 100 if entry_price else 0
+            arrow   = "📈" if move >= 0 else "📉"
+            remaining = duration - elapsed
+
+            dir_icon = "✅" if (
+                (direction == "CALL" and move > 0) or
+                (direction == "PUT"  and move < 0)
+            ) else "⚠️"
+
+            text = (
+                f"{arrow} {asset_label} ({direction}) | Entry: {entry_price:.5f}\n"
+                f"Now: {current:.5f}  ({move:+.5f} / {move_pct:+.4f}%)  {dir_icon}\n"
+                f"Candle: {candle}\n"
+                f"Time remaining: {max(0, remaining)}s"
+            )
+
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                )
+            except Exception:
+                pass   # message may have been deleted
+
+        # Final message
+        final_price = price_history[-1] if price_history else entry_price
+        final_move  = final_price - entry_price
+        final_result = (
+            "WIN ✅" if (
+                (direction == "CALL" and final_move > MIN_PRICE_MOVE) or
+                (direction == "PUT"  and final_move < -MIN_PRICE_MOVE)
+            ) else "LOSS ❌"
+        )
+        try:
+            await telegram_app.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=(
+                    f"🏁 {asset_label} ({direction}) — FINAL\n"
+                    f"Entry: {entry_price:.5f}\n"
+                    f"Exit:  {final_price:.5f}  ({final_move:+.5f})\n"
+                    f"Result: {final_result}"
+                ),
+            )
+        except Exception:
+            pass
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        log_error(f"_follow_price_task error: {exc}")
+    finally:
+        _follow_tasks.pop(signal_id, None)
 
 def _win_rate(rows: list[dict]) -> float:
     if not rows:
@@ -2008,6 +2304,24 @@ def _signal_caption(result: dict, asset_label: str, tf_label: str,
     return "\n".join(lines)
 
 
+def _schedule_validation(signal_id: str, chat_id: int, asset_label: str,
+                         entry_price: float, direction: str) -> None:
+    """Schedule auto-validation after VALIDATION_SECONDS if user has auto_validate on."""
+    ps = _get_user_settings(chat_id)
+    if not ps.get("auto_validate", True) or entry_price <= 0:
+        return
+    us = _get_user_session(chat_id)
+    if not us:
+        return
+    asset_code = ASSETS.get(asset_label, asset_label)
+    task = asyncio.create_task(
+        _validate_signal(signal_id, chat_id, us, asset_code, asset_label,
+                         direction, entry_price),
+        name=f"validate_{signal_id}",
+    )
+    _validation_tasks[signal_id] = task
+
+
 async def _send_signal_message(
     chat_id: int,
     result: dict,
@@ -2026,10 +2340,17 @@ async def _send_signal_message(
         return
 
     signal_id = _make_signal_id(chat_id)
+    entry_price_float = 0.0
+    try:
+        entry_price_float = float(price_str) if price_str and price_str != "N/A" else 0.0
+    except (ValueError, TypeError):
+        pass
+
     pending_signals[signal_id] = {
-        "user_id":    chat_id,
-        "ts":         time.time(),
-        "voted":      False,
+        "user_id":     chat_id,
+        "ts":          time.time(),
+        "voted":       False,
+        "followed":    False,   # prevent duplicate follow tasks
         # Metadata for CSV logging
         "asset_label": asset_label,
         "tf_label":    tf_label,
@@ -2037,22 +2358,35 @@ async def _send_signal_message(
         "confidence":  result.get("confidence", ""),
         "rsi":         result.get("rsi", ""),
         "price":       price_str,
+        "entry_price": entry_price_float,
         "market":      result.get("market", ""),
         "reason":      result.get("reason", ""),
     }
 
     img_url  = SIGNAL_IMG_BUY if direction == "HIGHER" else SIGNAL_IMG_SELL
     caption  = _signal_caption(result, asset_label, tf_label, price_str)
-    keyboard = _vote_keyboard(signal_id)
+
+    # Build keyboard: Win/Loss + Follow/Log buttons
+    trade_direction = "CALL" if direction == "HIGHER" else "PUT"
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("\U0001f44d Win",  callback_data=f"vote:win:{signal_id}"),
+            InlineKeyboardButton("\U0001f44e Loss", callback_data=f"vote:loss:{signal_id}"),
+        ],
+        [
+            InlineKeyboardButton("\U0001f50d Follow price", callback_data=f"follow:{signal_id}"),
+        ],
+    ])
 
     if img_url:
         try:
-            await telegram_app.bot.send_photo(
+            sent = await telegram_app.bot.send_photo(
                 chat_id=chat_id,
                 photo=img_url,
                 caption=caption,
                 reply_markup=keyboard,
             )
+            _schedule_validation(signal_id, chat_id, asset_label, entry_price_float, trade_direction)
             return
         except Exception as exc:
             logger.warning(f"send_photo failed for {chat_id}: {exc} — falling back to text")
@@ -2061,11 +2395,13 @@ async def _send_signal_message(
     if price_str:
         text += f"\nPrice: {price_str}"
     try:
-        await telegram_app.bot.send_message(
+        sent = await telegram_app.bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_markup=keyboard,
         )
+        pending_signals[signal_id]["message_id"] = sent.message_id
+        _schedule_validation(signal_id, chat_id, asset_label, entry_price_float, trade_direction)
     except Exception as exc:
         logger.error(f"send_message fallback also failed for {chat_id}: {exc}")
 
@@ -2722,6 +3058,73 @@ async def vote_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.callback_query.answer("Already recorded.")
 
 
+async def follow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle 'Follow price' button press — start live price tracking."""
+    query   = update.callback_query
+    await query.answer("Starting live price tracking...")
+    data    = query.data   # "follow:{signal_id}"
+    parts   = data.split(":", 1)
+    if len(parts) != 2:
+        return
+    signal_id = parts[1]
+
+    signal = pending_signals.get(signal_id)
+    if signal is None:
+        await query.answer("Signal expired — cannot follow.")
+        return
+
+    if signal.get("followed"):
+        await query.answer("Already following this signal.")
+        return
+
+    if time.time() - signal["ts"] > SIGNAL_EXPIRY_SEC:
+        await query.answer("Signal too old to follow.")
+        return
+
+    signal["followed"] = True
+    chat_id   = query.message.chat.id
+    us        = _get_user_session(chat_id)
+    if not us:
+        await query.answer("Not authorised.")
+        return
+
+    asset_label = signal.get("asset_label", "EUR/USD (OTC)")
+    asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
+    direction   = signal.get("direction", "CALL")
+    entry_price = float(signal.get("entry_price", 0) or 0)
+
+    if entry_price <= 0:
+        # Try to fetch current price as entry
+        entry_price = await _get_current_price(us, asset_code) or 0.0
+
+    # Send a new message to track (don't edit the photo message)
+    try:
+        sent = await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🔍 Following {asset_label} ({direction})\n"
+                f"Entry: {entry_price:.5f}\n"
+                f"Updating every {FOLLOW_INTERVAL_SEC}s for {FOLLOW_DURATION_SEC}s..."
+            ),
+        )
+        task = asyncio.create_task(
+            _follow_price_task(
+                signal_id=signal_id,
+                chat_id=chat_id,
+                message_id=sent.message_id,
+                us=us,
+                asset_code=asset_code,
+                asset_label=asset_label,
+                direction=direction,
+                entry_price=entry_price,
+            ),
+            name=f"follow_{signal_id}",
+        )
+        _follow_tasks[signal_id] = task
+    except Exception as exc:
+        logger.error(f"follow_handler error: {exc}")
+
+
 # ---------------------------------------------------------------------------
 # Analytics & trade log commands
 # ---------------------------------------------------------------------------
@@ -3304,6 +3707,175 @@ async def set_cooldown_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("Invalid value. Usage: /set_cooldown 120")
 
 
+@_require_auth
+async def paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show paper trading virtual balance and stats."""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+    balance = float(ps.get("paper_balance", PAPER_START_BALANCE))
+    stake   = float(ps.get("paper_stake",   PAPER_STAKE))
+    rows    = _read_paper_trades(chat_id)
+
+    total = len(rows)
+    wins  = sum(1 for r in rows if r.get("result") == "win")
+    pnl   = sum(float(r.get("pnl", 0)) for r in rows)
+    wr    = f"{wins/total*100:.1f}%" if total else "—"
+
+    last_5 = rows[-5:] if rows else []
+    last_5_str = "  ".join(
+        ("✅" if r.get("result") == "win" else "❌") for r in last_5
+    ) or "—"
+
+    await update.message.reply_text(
+        f"📊 Paper Trading\n\n"
+        f"Virtual balance: ${balance:.2f}\n"
+        f"Starting balance: ${PAPER_START_BALANCE:.2f}\n"
+        f"Total P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}$\n\n"
+        f"Total trades: {total}\n"
+        f"Wins: {wins}  Win rate: {wr}\n"
+        f"Stake per trade: ${stake:.2f}\n"
+        f"Last 5: {last_5_str}\n\n"
+        "Use /paper_reset to reset balance.\n"
+        "Use /export_paper to download paper trades CSV."
+    )
+
+
+@_require_auth
+async def paper_reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reset paper trading balance and history."""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+    ps["paper_balance"] = PAPER_START_BALANCE
+    _save_user_persistent_settings()
+    # Archive old paper trades
+    path = _paper_path(chat_id)
+    if os.path.exists(path):
+        archive = path.replace(".csv", f"_archive_{int(time.time())}.csv")
+        try:
+            os.rename(path, archive)
+        except Exception:
+            pass
+    await update.message.reply_text(
+        f"✅ Paper trading reset.\n"
+        f"Balance restored to ${PAPER_START_BALANCE:.2f}.\n"
+        "Previous trades archived."
+    )
+
+
+@_require_auth
+async def export_paper_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Export paper trades CSV."""
+    chat_id = update.effective_chat.id
+    path    = _paper_path(chat_id)
+    if not os.path.exists(path):
+        await update.message.reply_text("No paper trades yet.")
+        return
+    try:
+        with open(path, "rb") as f:
+            await telegram_app.bot.send_document(
+                chat_id=chat_id,
+                document=f,
+                filename=f"paper_{chat_id}.csv",
+                caption=f"📁 Paper trades — {len(_read_paper_trades(chat_id))} trades",
+            )
+    except Exception as exc:
+        await update.message.reply_text(f"Export error: {exc}")
+
+
+@_require_auth
+async def validation_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show auto-validation stats."""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+    rows    = _read_validations(chat_id)
+    enabled = ps.get("auto_validate", True)
+
+    total = len(rows)
+    wins  = sum(1 for r in rows if r.get("result") == "win")
+    wr    = f"{wins/total*100:.1f}%" if total else "—"
+
+    last_10 = rows[-10:]
+    last_10_str = "  ".join(
+        ("✅" if r.get("result") == "win" else "❌") for r in last_10
+    ) or "—"
+
+    await update.message.reply_text(
+        f"🔍 Signal Validation\n\n"
+        f"Auto-validate: {'ON ✅' if enabled else 'OFF 🔕'}\n"
+        f"Validation delay: {VALIDATION_SECONDS}s\n\n"
+        f"Total validated: {total}\n"
+        f"Wins: {wins}  Win rate: {wr}\n"
+        f"Last 10: {last_10_str}\n\n"
+        "Toggle: /autovalidate on|off"
+    )
+
+
+@_require_auth
+async def autovalidate_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle automatic signal validation and paper trading."""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1:
+            args = parts[1:]
+
+    if not args:
+        enabled = ps.get("auto_validate", True)
+        await update.message.reply_text(
+            f"Auto-validate: {'ON ✅' if enabled else 'OFF 🔕'}\n\n"
+            "When ON, the bot automatically checks the price after 60s\n"
+            "and updates your paper trading balance.\n\n"
+            "Commands:\n"
+            "  /autovalidate on\n"
+            "  /autovalidate off"
+        )
+        return
+
+    arg = args[0].lower()
+    if arg == "on":
+        ps["auto_validate"] = True
+        _save_user_persistent_settings()
+        await update.message.reply_text(
+            "✅ Auto-validation ON\n"
+            f"Signals will be validated {VALIDATION_SECONDS}s after generation.\n"
+            "Paper balance updated automatically."
+        )
+    elif arg == "off":
+        ps["auto_validate"] = False
+        _save_user_persistent_settings()
+        await update.message.reply_text(
+            "🔕 Auto-validation OFF\n"
+            "No automatic validation or paper trading updates."
+        )
+    else:
+        await update.message.reply_text("Usage: /autovalidate on  or  /autovalidate off")
+
+
+@_require_auth
+async def manual_trades_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List recent manually logged trades (from 👍/👎 votes)."""
+    chat_id = update.effective_chat.id
+    rows    = _read_trades(chat_id)
+    if not rows:
+        await update.message.reply_text("No trades logged yet. Mark signals with 👍/👎.")
+        return
+
+    last_10 = rows[-10:]
+    lines   = ["📋 Recent Manual Trades\n"]
+    for r in reversed(last_10):
+        icon = "✅" if r.get("result") == "win" else "❌"
+        lines.append(
+            f"{icon} {r.get('timestamp','')[:16]}  "
+            f"{r.get('asset','')}  {r.get('direction','')}  "
+            f"conf={r.get('confidence','')}%"
+        )
+    lines.append(f"\nTotal: {len(rows)} trades. Use /export for full CSV.")
+    await update.message.reply_text("\n".join(lines))
+
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
@@ -3320,10 +3892,17 @@ conv_handler = ConversationHandler(
 telegram_app.add_handler(conv_handler)
 telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler, pattern="^vote:noop$"))
 telegram_app.add_handler(CallbackQueryHandler(vote_handler,      pattern="^vote:(win|loss):"))
+telegram_app.add_handler(CallbackQueryHandler(follow_handler,    pattern="^follow:"))
 telegram_app.add_handler(CommandHandler("signal",             signal_command))
 telegram_app.add_handler(CommandHandler("stats",              stats_command))
 telegram_app.add_handler(CommandHandler("analyze",            analyze_command))
 telegram_app.add_handler(CommandHandler("export",             export_command))
+telegram_app.add_handler(CommandHandler("paper",              paper_command))
+telegram_app.add_handler(CommandHandler("paper_reset",        paper_reset_command))
+telegram_app.add_handler(CommandHandler("export_paper",       export_paper_command))
+telegram_app.add_handler(CommandHandler("validation",         validation_command))
+telegram_app.add_handler(CommandHandler("autovalidate",       autovalidate_command))
+telegram_app.add_handler(CommandHandler("manual_trades",      manual_trades_command))
 telegram_app.add_handler(CommandHandler("strategy",           strategy_command))
 telegram_app.add_handler(CommandHandler("autotime",           autotime_command))
 telegram_app.add_handler(CommandHandler("adx",                adx_command))
