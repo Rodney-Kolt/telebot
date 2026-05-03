@@ -653,6 +653,36 @@ async def _maybe_send_10_trade_summary(chat_id: int) -> None:
 # ---------------------------------------------------------------------------
 telegram_app = Application.builder().token(TOKEN).build()
 
+async def retry_async(func, max_retries: int = 5, base_delay: float = 2.0):
+    """
+    Exponential back-off retry wrapper for async callables.
+
+    Usage:
+        candles = await retry_async(lambda: sm.client.get_candles(...))
+
+    Parameters
+    ----------
+    func        : zero-argument async callable to retry
+    max_retries : maximum number of attempts (default 5)
+    base_delay  : initial wait in seconds; doubles each attempt (default 2)
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except Exception as exc:
+            last_exc = exc
+            if attempt == max_retries - 1:
+                raise
+            wait = base_delay * (2 ** attempt)   # 2, 4, 8, 16, 32 …
+            logger.warning(
+                f"retry_async attempt {attempt + 1}/{max_retries} "
+                f"failed: {exc}. Retrying in {wait:.0f}s…"
+            )
+            await asyncio.sleep(wait)
+    raise last_exc  # unreachable but satisfies type checkers
+
+
 # ---------------------------------------------------------------------------
 # SessionManager
 # ---------------------------------------------------------------------------
@@ -713,14 +743,18 @@ class SessionManager:
         logger.info(f"[{self.name}] SessionManager stopped.")
 
     async def get_candles(self, **kwargs):
-        """Proxy to client.get_candles; triggers reconnect on failure."""
+        """Proxy to client.get_candles with exponential back-off retry."""
         if not self.is_connected:
             await self._handle_error("get_candles called while disconnected")
             return []
         try:
-            return await self.client.get_candles(**kwargs)
+            return await retry_async(
+                lambda: self.client.get_candles(**kwargs),
+                max_retries=5,
+                base_delay=2.0,
+            )
         except Exception as exc:
-            await self._handle_error(f"get_candles error: {exc}")
+            await self._handle_error(f"get_candles error after retries: {exc}")
             return []
 
     async def notify_error(self, raw_error: str) -> None:
@@ -894,6 +928,52 @@ def _rsi(values: list[float], period: int = 14) -> float | None:
     return 100 - (100 / (1 + rs))
 
 
+def calculate_macd(
+    closes: list[float],
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[float | None, float | None, float | None]:
+    """
+    Pure-Python MACD calculation.
+
+    Returns (macd_line, signal_line, histogram) using the most recent values,
+    or (None, None, None) if there is not enough data.
+
+    Parameters
+    ----------
+    closes  : list of closing prices (oldest → newest)
+    fast    : fast EMA period  (default 12)
+    slow    : slow EMA period  (default 26)
+    signal  : signal EMA period (default 9)
+    """
+    # Need at least slow + signal - 1 candles to produce one signal value
+    min_len = slow + signal - 1
+    if len(closes) < min_len:
+        return None, None, None
+
+    fast_ema  = _ema(closes, fast)
+    slow_ema  = _ema(closes, slow)
+
+    if not fast_ema or not slow_ema:
+        return None, None, None
+
+    # Align: fast_ema is longer than slow_ema by (slow - fast) elements
+    offset     = len(fast_ema) - len(slow_ema)
+    macd_line  = [f - s for f, s in zip(fast_ema[offset:], slow_ema)]
+
+    signal_ema = _ema(macd_line, signal)
+    if not signal_ema:
+        return None, None, None
+
+    # Return the most recent values
+    macd_val   = macd_line[-1]
+    signal_val = signal_ema[-1]
+    hist_val   = macd_val - signal_val
+
+    return macd_val, signal_val, hist_val
+
+
 def _market_condition(candles: list) -> str:
     """Classify market as Trending, Ranging, or Volatile."""
     if len(candles) < 10:
@@ -921,19 +1001,36 @@ def compute_signal_advanced(
     timeframe_seconds: int = 60,
 ) -> dict:
     """
+    Hybrid MACD + RSI signal engine.
+
+    Primary strategy (requires both confirmations):
+      CALL  →  RSI < 35  AND  MACD line > Signal line  (oversold + bullish momentum)
+      PUT   →  RSI > 65  AND  MACD line < Signal line  (overbought + bearish momentum)
+
+    Fallback (when MACD data is insufficient):
+      Uses the original RSI + EMA crossover logic with a reduced confidence cap.
+
     Returns a dict with keys:
       direction   – "HIGHER" | "LOWER" | "WAIT"
       confidence  – int 0-100
       rsi         – float | None
+      macd        – float | None   (MACD line value)
+      macd_signal – float | None   (Signal line value)
+      histogram   – float | None
       reason      – str
       market      – str
+      strategy    – "MACD+RSI" | "RSI+EMA (fallback)"
     """
     result = {
-        "direction":  "WAIT",
-        "confidence": 0,
-        "rsi":        None,
-        "reason":     "Not enough data",
-        "market":     "Unknown",
+        "direction":   "WAIT",
+        "confidence":  0,
+        "rsi":         None,
+        "macd":        None,
+        "macd_signal": None,
+        "histogram":   None,
+        "reason":      "Not enough data",
+        "market":      "Unknown",
+        "strategy":    "MACD+RSI",
     }
 
     if not candles or len(candles) < 20:
@@ -941,91 +1038,141 @@ def compute_signal_advanced(
 
     closes = _closes(candles)
     rsi    = _rsi(closes, 14)
-    ema9   = _ema(closes, 9)
-    ema21  = _ema(closes, 21)
     market = _market_condition(candles)
 
     result["rsi"]    = rsi
     result["market"] = market
 
-    if rsi is None or not ema9 or not ema21:
-        result["reason"] = "Insufficient data for indicators"
+    if rsi is None:
+        result["reason"] = "Insufficient RSI data"
+        return result
+
+    # ── Try primary MACD+RSI strategy ────────────────────────────────────
+    macd_val, signal_val, hist_val = calculate_macd(closes)
+
+    if macd_val is not None:
+        result["macd"]        = round(macd_val,   6)
+        result["macd_signal"] = round(signal_val, 6)
+        result["histogram"]   = round(hist_val,   6)
+        result["strategy"]    = "MACD+RSI"
+
+        logger.debug(
+            f"MACD+RSI | RSI={rsi:.1f} | MACD={macd_val:.6f} "
+            f"| Signal={signal_val:.6f} | Hist={hist_val:.6f}"
+        )
+
+        direction = "WAIT"
+        confidence = 0
+
+        if rsi < 35 and macd_val > signal_val:
+            direction = "HIGHER"
+            # Confidence: RSI extremity (0-20 pts) + histogram strength (0-10 pts)
+            rsi_pts  = max(0, (35 - rsi) / 35) * 20
+            hist_pts = min(10, abs(hist_val) * 1e5)   # scale tiny forex values
+            confidence = min(97, max(60, int(70 + rsi_pts + hist_pts)))
+            reason = (
+                f"RSI={rsi:.1f} (oversold), MACD crossover bullish "
+                f"(hist={hist_val:+.6f})"
+            )
+
+        elif rsi > 65 and macd_val < signal_val:
+            direction = "LOWER"
+            rsi_pts  = max(0, (rsi - 65) / 35) * 20
+            hist_pts = min(10, abs(hist_val) * 1e5)
+            confidence = min(97, max(60, int(70 + rsi_pts + hist_pts)))
+            reason = (
+                f"RSI={rsi:.1f} (overbought), MACD crossover bearish "
+                f"(hist={hist_val:+.6f})"
+            )
+
+        else:
+            # Conditions not both met — explain why
+            if rsi < 35:
+                reason = f"RSI={rsi:.1f} oversold but MACD not yet bullish (hist={hist_val:+.6f})"
+            elif rsi > 65:
+                reason = f"RSI={rsi:.1f} overbought but MACD not yet bearish (hist={hist_val:+.6f})"
+            else:
+                reason = f"RSI={rsi:.1f} neutral — waiting for RSI extreme + MACD confirmation"
+            result["reason"] = reason
+            return result
+
+        # Timeframe noise penalty
+        if timeframe_seconds <= 5:
+            confidence = max(55, confidence - 8)
+        elif timeframe_seconds <= 15:
+            confidence = max(55, confidence - 4)
+
+        result.update({
+            "direction":  direction,
+            "confidence": confidence,
+            "reason":     reason,
+        })
+        return result
+
+    # ── Fallback: RSI + EMA crossover (not enough data for MACD) ─────────
+    logger.warning(
+        f"MACD calculation failed (need {26 + 9 - 1} candles, got {len(closes)}). "
+        "Falling back to RSI+EMA strategy."
+    )
+    result["strategy"] = "RSI+EMA (fallback)"
+
+    ema9  = _ema(closes, 9)
+    ema21 = _ema(closes, 21)
+
+    if not ema9 or not ema21:
+        result["reason"] = "Insufficient EMA data"
         return result
 
     price     = closes[-1]
     ema9_val  = ema9[-1]
     ema21_val = ema21[-1]
 
-    bullish_signals = 0
-    bearish_signals = 0
+    bullish = 0
+    bearish = 0
 
-    # RSI
-    if rsi < 35:
-        bullish_signals += 2
-    elif rsi < 45:
-        bullish_signals += 1
-    elif rsi > 65:
-        bearish_signals += 2
-    elif rsi > 55:
-        bearish_signals += 1
+    if rsi < 35:   bullish += 2
+    elif rsi < 45: bullish += 1
+    elif rsi > 65: bearish += 2
+    elif rsi > 55: bearish += 1
 
-    # EMA crossover
-    if ema9_val > ema21_val:
-        bullish_signals += 2
-    elif ema9_val < ema21_val:
-        bearish_signals += 2
+    if ema9_val > ema21_val: bullish += 2
+    else:                    bearish += 2
 
-    # Price vs EMA9
-    if price > ema9_val:
-        bullish_signals += 1
-    else:
-        bearish_signals += 1
+    if price > ema9_val: bullish += 1
+    else:                bearish += 1
 
-    # 3-candle momentum
     if len(closes) >= 4:
         c = closes[-4:]
-        if c[-1] > c[-2] > c[-3] > c[-4]:
-            bullish_signals += 1
-        elif c[-1] < c[-2] < c[-3] < c[-4]:
-            bearish_signals += 1
+        if c[-1] > c[-2] > c[-3] > c[-4]:   bullish += 1
+        elif c[-1] < c[-2] < c[-3] < c[-4]: bearish += 1
 
-    total = bullish_signals + bearish_signals
+    total = bullish + bearish
     if total == 0:
         return result
 
-    if bullish_signals > bearish_signals:
+    if bullish > bearish:
         direction = "HIGHER"
-        raw_conf  = bullish_signals / total
-    elif bearish_signals > bullish_signals:
+        raw_conf  = bullish / total
+    elif bearish > bullish:
         direction = "LOWER"
-        raw_conf  = bearish_signals / total
+        raw_conf  = bearish / total
     else:
-        result["direction"]  = "WAIT"
-        result["reason"]     = "Mixed signals \u2014 no clear edge"
+        result["reason"] = "Mixed signals — no clear edge"
         result["confidence"] = 50
         return result
 
-    # Confidence score
-    base_conf = 50 + raw_conf * 30
-
-    if direction == "HIGHER" and rsi is not None:
-        rsi_bonus = max(0, (40 - rsi) / 40) * 15
-    elif direction == "LOWER" and rsi is not None:
-        rsi_bonus = max(0, (rsi - 60) / 40) * 15
+    base_conf = 50 + raw_conf * 25   # capped lower than primary strategy
+    if direction == "HIGHER":
+        rsi_bonus = max(0, (40 - rsi) / 40) * 10
     else:
-        rsi_bonus = 0
+        rsi_bonus = max(0, (rsi - 60) / 40) * 10
 
-    tf_penalty = 0
-    if timeframe_seconds <= 5:
-        tf_penalty = 8
-    elif timeframe_seconds <= 15:
-        tf_penalty = 4
+    tf_penalty = 8 if timeframe_seconds <= 5 else (4 if timeframe_seconds <= 15 else 0)
+    confidence = min(85, max(51, int(base_conf + rsi_bonus - tf_penalty)))
 
-    confidence = min(97, max(51, int(base_conf + rsi_bonus - tf_penalty)))
-
-    ema_desc = "EMA9 > EMA21" if ema9_val > ema21_val else "EMA9 < EMA21"
+    ema_desc = "EMA9>EMA21" if ema9_val > ema21_val else "EMA9<EMA21"
     reason = (
-        f"RSI={rsi:.1f}, {ema_desc}, "
+        f"[Fallback] RSI={rsi:.1f}, {ema_desc}, "
         f"{'bullish' if direction == 'HIGHER' else 'bearish'} momentum"
     )
 
