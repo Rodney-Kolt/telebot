@@ -335,10 +335,120 @@ def _get_user_persistent(chat_id: int) -> dict:
     if key not in user_persistent_settings:
         user_persistent_settings[key] = {
             "restrict_to_best_window": False,
-            "best_window_start": None,
-            "best_window_end":   None,
+            "best_window_start":       None,
+            "best_window_end":         None,
+            "news_filter_enabled":     True,   # ON by default
         }
     return user_persistent_settings[str(chat_id)]
+
+
+# ---------------------------------------------------------------------------
+# Economic Calendar Filter
+# ---------------------------------------------------------------------------
+# Source: ForexFactory weekly JSON (no auth required, updated weekly)
+# URL: https://nfs.faireconomy.media/ff_calendar_thisweek.json
+# Date format in response: ISO 8601 with UTC offset e.g. "2026-05-05T00:30:00-04:00"
+
+# Maps asset labels used in this bot → relevant currency codes for news filtering
+_ASSET_CURRENCIES: dict[str, list[str]] = {
+    "EUR/USD (OTC)": ["EUR", "USD"],
+    "AUD/USD (OTC)": ["AUD", "USD"],
+    "USD/JPY (OTC)": ["USD", "JPY"],
+    "GBP/USD (OTC)": ["GBP", "USD"],
+    "USD/CAD (OTC)": ["USD", "CAD"],
+    "EUR/JPY (OTC)": ["EUR", "JPY"],
+    # Commodities — USD news affects Gold/Oil
+    "XAUUSD_otc":    ["USD"],
+    "USCrude_otc":   ["USD"],
+}
+
+# In-memory cache: list of {"title", "country", "dt_utc": datetime, "impact"}
+_calendar_cache: list[dict] = []
+_calendar_last_fetch: float = 0.0
+_CALENDAR_FETCH_INTERVAL = 3600   # refresh every hour
+_NEWS_BLOCK_MINUTES       = 10    # block signals N minutes before event
+
+
+async def _refresh_calendar() -> None:
+    """Fetch today's + this week's high-impact events from ForexFactory."""
+    global _calendar_cache, _calendar_last_fetch
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            events = r.json()
+
+        parsed = []
+        for ev in events:
+            if ev.get("impact") not in ("High",):
+                continue
+            try:
+                # Parse ISO 8601 with offset → UTC datetime
+                from datetime import timezone
+                dt_str = ev["date"]
+                # Python 3.11+ fromisoformat handles offset; earlier needs manual strip
+                try:
+                    dt_local = datetime.fromisoformat(dt_str)
+                except ValueError:
+                    # Fallback: strip offset and treat as UTC
+                    dt_local = datetime.fromisoformat(dt_str[:19])
+                    dt_local = dt_local.replace(tzinfo=timezone.utc)
+                dt_utc = dt_local.astimezone(timezone.utc).replace(tzinfo=None)
+                parsed.append({
+                    "title":   ev.get("title", ""),
+                    "country": ev.get("country", ""),
+                    "dt_utc":  dt_utc,
+                    "impact":  ev.get("impact", ""),
+                })
+            except Exception as exc:
+                logger.debug(f"Calendar parse error for {ev}: {exc}")
+
+        _calendar_cache = parsed
+        _calendar_last_fetch = time.time()
+        logger.info(f"Economic calendar refreshed: {len(parsed)} high-impact events this week")
+
+    except Exception as exc:
+        logger.warning(f"Could not refresh economic calendar: {exc}")
+
+
+async def _ensure_calendar_fresh() -> None:
+    """Refresh the calendar cache if it's older than _CALENDAR_FETCH_INTERVAL."""
+    if time.time() - _calendar_last_fetch > _CALENDAR_FETCH_INTERVAL:
+        await _refresh_calendar()
+
+
+def is_high_impact_news_approaching(asset_label: str,
+                                    window_minutes: int = _NEWS_BLOCK_MINUTES
+                                    ) -> tuple[bool, str]:
+    """
+    Returns (True, event_description) if a high-impact news event is scheduled
+    within the next `window_minutes` minutes for the currencies of `asset_label`.
+    Returns (False, "") otherwise.
+    """
+    currencies = _ASSET_CURRENCIES.get(asset_label, [])
+    if not currencies:
+        # Unknown asset — check USD as a safe default
+        currencies = ["USD"]
+
+    now_utc = datetime.utcnow()
+    cutoff  = now_utc + timedelta(minutes=window_minutes)
+
+    for ev in _calendar_cache:
+        if ev["country"] not in currencies:
+            continue
+        dt = ev["dt_utc"]
+        if now_utc <= dt <= cutoff:
+            mins_away = int((dt - now_utc).total_seconds() / 60)
+            desc = f"{ev['title']} ({ev['country']}) in ~{mins_away}m"
+            return True, desc
+
+    return False, ""
+
+
+def _news_filter_active(chat_id: int) -> bool:
+    """Return True if the news filter is enabled for this user (default: True)."""
+    return _get_user_persistent(chat_id).get("news_filter_enabled", True)
 
 
 def _csv_path(chat_id: int) -> str:
@@ -982,10 +1092,15 @@ async def _user_poll_loop(us: UserSession) -> None:
                 result    = compute_signal_advanced(candles)
                 price_str = f"{price:.5f}" if price else "N/A"
 
-                # Check time-window restriction for each recipient
+                # Refresh calendar cache if stale (non-blocking)
+                await _ensure_calendar_fresh()
+
+                # Check time-window restriction and news filter for each recipient
                 current_hour = datetime.utcnow().hour
                 for cid in us.all_broadcast_ids():
                     ps = _get_user_persistent(cid)
+
+                    # ── Time-window restriction ───────────────────────────
                     if ps.get("restrict_to_best_window"):
                         ws = ps.get("best_window_start")
                         we = ps.get("best_window_end")
@@ -993,6 +1108,26 @@ async def _user_poll_loop(us: UserSession) -> None:
                             if not (ws <= current_hour < we):
                                 logger.debug(f"[{us.name}] Skipping signal for {cid} — outside window {ws}-{we} UTC")
                                 continue
+
+                    # ── News filter ───────────────────────────────────────
+                    if _news_filter_active(cid):
+                        asset_label = "EUR/USD (OTC)"   # default auto-signal asset
+                        blocked, event_desc = is_high_impact_news_approaching(asset_label)
+                        if blocked:
+                            logger.info(f"[{us.name}] Signal paused for {cid} — {event_desc}")
+                            try:
+                                await telegram_app.bot.send_message(
+                                    chat_id=cid,
+                                    text=(
+                                        f"\u26a0\ufe0f Signal paused for {asset_label}\n"
+                                        f"High-impact news approaching: {event_desc}\n"
+                                        "Use /disable_news_filter to trade through news."
+                                    ),
+                                )
+                            except Exception:
+                                pass
+                            continue
+
                     await _send_signal_message(
                         chat_id=cid,
                         result=result,
@@ -1261,6 +1396,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/export \u2014 download your trade log (CSV)\n"
         "/restrict_window \u2014 only receive signals in your best hours\n"
         "/clear_restriction \u2014 remove time-window filter\n"
+        "/news \u2014 upcoming high-impact events + filter status\n"
+        "/enable_news_filter \u2014 pause signals before news\n"
+        "/disable_news_filter \u2014 trade through news\n"
         "/autoon \u2014 enable auto-signals\n"
         "/autooff \u2014 disable auto-signals\n"
         "/status \u2014 connection status\n"
@@ -1463,6 +1601,18 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     result = await _fetch_signal(asset_code, tf_seconds, us)
+
+    # News filter check for manual signals too
+    if result["direction"] != "WAIT" and _news_filter_active(update.effective_chat.id):
+        await _ensure_calendar_fresh()
+        blocked, event_desc = is_high_impact_news_approaching(asset_label)
+        if blocked:
+            await update.message.reply_text(
+                f"\u26a0\ufe0f Signal paused for {asset_label}\n"
+                f"High-impact news approaching: {event_desc}\n\n"
+                "Use /disable_news_filter to trade through news events."
+            )
+            return
 
     if result["direction"] == "WAIT":
         await update.message.reply_text(_format_signal(result, asset_label, tf_label))
@@ -1876,6 +2026,73 @@ async def clear_restriction_command(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+@_require_auth
+async def enable_news_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable the economic calendar news filter for this user."""
+    chat_id = update.effective_chat.id
+    ps = _get_user_persistent(chat_id)
+    ps["news_filter_enabled"] = True
+    _save_user_persistent_settings()
+    await update.message.reply_text(
+        "\U0001f4f0 Economic Calendar Filter ENABLED\n\n"
+        "Signals will be paused for 10 minutes before any high-impact news event "
+        "(NFP, CPI, interest rate decisions, etc.).\n\n"
+        "Use /disable_news_filter to trade through news events."
+    )
+
+
+@_require_auth
+async def disable_news_filter_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable the economic calendar news filter for this user."""
+    chat_id = update.effective_chat.id
+    ps = _get_user_persistent(chat_id)
+    ps["news_filter_enabled"] = False
+    _save_user_persistent_settings()
+    await update.message.reply_text(
+        "\U0001f4f0 Economic Calendar Filter DISABLED\n\n"
+        "You will now receive signals even during high-impact news events.\n\n"
+        "\u26a0\ufe0f Trading during news carries higher risk.\n"
+        "Use /enable_news_filter to re-enable protection."
+    )
+
+
+@_require_auth
+async def news_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show upcoming high-impact news events and current filter status."""
+    chat_id = update.effective_chat.id
+    await _ensure_calendar_fresh()
+
+    enabled = _news_filter_active(chat_id)
+    status  = "ON \u2705" if enabled else "OFF \U0001f515"
+
+    now_utc = datetime.utcnow()
+    # Show next 5 high-impact events
+    upcoming = sorted(
+        [ev for ev in _calendar_cache if ev["dt_utc"] >= now_utc],
+        key=lambda e: e["dt_utc"]
+    )[:5]
+
+    lines = [
+        f"\U0001f4f0 Economic Calendar Filter: {status}",
+        "",
+        "Upcoming high-impact events (UTC):",
+    ]
+    if upcoming:
+        for ev in upcoming:
+            mins = int((ev["dt_utc"] - now_utc).total_seconds() / 60)
+            time_str = ev["dt_utc"].strftime("%a %H:%M")
+            lines.append(f"  \u2022 {time_str} — {ev['title']} ({ev['country']}) in {mins}m")
+    else:
+        lines.append("  No high-impact events found for this week.")
+
+    lines += [
+        "",
+        "/enable_news_filter  — pause signals before news",
+        "/disable_news_filter — trade through news",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
 # ---------------------------------------------------------------------------
 # Register handlers
 # ---------------------------------------------------------------------------
@@ -1902,6 +2119,9 @@ telegram_app.add_handler(CommandHandler("analyze",            analyze_command))
 telegram_app.add_handler(CommandHandler("export",             export_command))
 telegram_app.add_handler(CommandHandler("restrict_window",    restrict_window_command))
 telegram_app.add_handler(CommandHandler("clear_restriction",  clear_restriction_command))
+telegram_app.add_handler(CommandHandler("enable_news_filter",  enable_news_filter_command))
+telegram_app.add_handler(CommandHandler("disable_news_filter", disable_news_filter_command))
+telegram_app.add_handler(CommandHandler("news",                news_status_command))
 telegram_app.add_handler(CommandHandler("autoon",             autoon_command))
 telegram_app.add_handler(CommandHandler("autooff",            autooff_command))
 telegram_app.add_handler(CommandHandler("status",             status_command))
@@ -1981,6 +2201,9 @@ async def lifespan(app: Starlette):
     await reset_and_set_webhook()
     _load_stats()
     _load_user_persistent_settings()
+
+    # Pre-fetch economic calendar
+    await _refresh_calendar()
 
     # Build user registry and start per-user sessions
     configs = _load_user_configs()
