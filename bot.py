@@ -2429,14 +2429,29 @@ def _require_auth(func):
 # ---------------------------------------------------------------------------
 
 def _main_menu_keyboard(user_id: int, us: "UserSession | None" = None) -> InlineKeyboardMarkup:
-    ps   = _get_user_settings(user_id)
-    auto = ps.get("auto", False)
-    auto_label = "\U0001f514 Auto-signals: ON" if auto else "\U0001f515 Auto-signals: OFF"
+    ps      = _get_user_settings(user_id)
+    auto    = ps.get("auto", False)
+    scanner = ps.get("scanner", False)
+    auto_label    = "\U0001f514 Auto-signals: ON"  if auto    else "\U0001f515 Auto-signals: OFF"
+    scanner_label = "\U0001f4e1 Scanner: ON"        if scanner else "\U0001f4e1 Scanner: OFF"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001f4ca Get Signal",     callback_data="menu:signal")],
-        [InlineKeyboardButton("\u2139\ufe0f How it works", callback_data="menu:howto")],
-        [InlineKeyboardButton("\u2699\ufe0f Settings",     callback_data="menu:settings")],
-        [InlineKeyboardButton(auto_label,                  callback_data="menu:toggle_auto")],
+        # ── Signals ──────────────────────────────────────────────────────
+        [InlineKeyboardButton("\U0001f4ca Get Signal",       callback_data="menu:signal")],
+        [InlineKeyboardButton(auto_label,                    callback_data="menu:toggle_auto"),
+         InlineKeyboardButton(scanner_label,                 callback_data="menu:toggle_scanner")],
+        # ── Strategy & analysis ───────────────────────────────────────────
+        [InlineKeyboardButton("\U0001f9e0 Strategy",         callback_data="menu:strategy"),
+         InlineKeyboardButton("\U0001f4ca ADX",              callback_data="menu:adx")],
+        [InlineKeyboardButton("\U0001f4cb Analyze",          callback_data="menu:analyze"),
+         InlineKeyboardButton("\U0001f3c6 Recommend",        callback_data="menu:recommend")],
+        # ── Paper trading & validation ────────────────────────────────────
+        [InlineKeyboardButton("\U0001f4b0 Paper Balance",    callback_data="menu:paper"),
+         InlineKeyboardButton("\U0001f50d Validation",       callback_data="menu:validation")],
+        [InlineKeyboardButton("\U0001f4c4 Manual Trades",    callback_data="menu:manual_trades"),
+         InlineKeyboardButton("\U0001f4e4 Export CSV",       callback_data="menu:export")],
+        # ── Settings & info ───────────────────────────────────────────────
+        [InlineKeyboardButton("\u2699\ufe0f Settings",       callback_data="menu:settings"),
+         InlineKeyboardButton("\u2139\ufe0f How it works",   callback_data="menu:howto")],
     ])
 
 
@@ -2595,6 +2610,262 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
             ]),
         )
+        return ConversationHandler.END
+
+    if data == "menu:toggle_scanner":
+        settings["scanner"] = not settings.get("scanner", False)
+        _save_user_persistent_settings()
+        state = "ON \u2705" if settings["scanner"] else "OFF \U0001f515"
+        # Start/stop scanner tasks
+        if settings["scanner"] and us and not getattr(us, "_scanner_tasks", None):
+            us._scanner_tasks = await _start_scanner(us)
+        elif not settings["scanner"] and us:
+            for t in getattr(us, "_scanner_tasks", []):
+                if not t.done():
+                    t.cancel()
+            us._scanner_tasks = []
+        await query.edit_message_text(
+            f"\U0001f4e1 Scanner turned {state}\n\n"
+            f"{'Monitoring' if settings['scanner'] else 'Stopped monitoring'} "
+            f"{len(SCAN_ASSETS)} assets.\n"
+            f"{'Make sure /autoon is enabled.' if settings['scanner'] else ''}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:strategy":
+        current = settings.get("strategy", "trend")
+        auto_s  = settings.get("auto_strategy", True)
+        await query.edit_message_text(
+            f"\U0001f9e0 Strategy\n\n"
+            f"Current: {current.upper()}\n"
+            f"ADX auto-switch: {'ON' if auto_s else 'OFF'}\n\n"
+            "Choose a strategy:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📈 TREND (MACD+RSI)",      callback_data="menu:set_strategy:trend")],
+                [InlineKeyboardButton("📉 REVERSAL (Bollinger)",  callback_data="menu:set_strategy:reversal")],
+                [InlineKeyboardButton("🤖 ADX Auto: ON" if auto_s else "🤖 ADX Auto: OFF",
+                                      callback_data="menu:toggle_autostrategy")],
+                [InlineKeyboardButton("\U0001f519 Back",           callback_data="menu:back")],
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data.startswith("menu:set_strategy:"):
+        chosen = data.split(":")[-1]
+        if chosen in ("trend", "reversal"):
+            settings["strategy"] = chosen
+            _save_user_persistent_settings()
+        await query.edit_message_text(
+            f"\u2705 Selected strategy is now: {chosen.upper()}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:toggle_autostrategy":
+        settings["auto_strategy"] = not settings.get("auto_strategy", True)
+        _save_user_persistent_settings()
+        state = "ON \u2705" if settings["auto_strategy"] else "OFF \U0001f515"
+        await query.edit_message_text(
+            f"\U0001f916 ADX Auto-Strategy: {state}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:strategy")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:adx":
+        await query.edit_message_text("\u23f3 Fetching ADX...")
+        # Reuse adx_command logic inline
+        ps          = _get_user_settings(user_id)
+        asset_label = ps.get("asset", DEFAULT_SETTINGS["asset"])
+        asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
+        tf_seconds  = TIMEFRAMES.get(ps.get("timeframe", "1 minute"), 60)
+        sm = us.session_manager if us else None
+        adx_text = "Could not compute ADX."
+        if sm and sm.is_connected:
+            try:
+                candles = await sm.get_candles(asset=asset_code, timeframe=tf_seconds, count=CANDLE_COUNT)
+                if candles and len(candles) >= 16:
+                    highs  = [float(c["high"]  if isinstance(c, dict) else c.high)  for c in candles]
+                    lows   = [float(c["low"]   if isinstance(c, dict) else c.low)   for c in candles]
+                    closes = _closes(candles)
+                    adx    = calculate_adx(highs, lows, closes)
+                    if adx is not None:
+                        rec = _adx_strategy_recommendation(adx)
+                        strength = ("Strong trend \U0001f4c8" if adx > 25
+                                    else "Ranging \u27a1\ufe0f" if adx < 20
+                                    else "Weak trend \u26a0\ufe0f")
+                        adx_text = (f"\U0001f4ca ADX: {adx:.1f}  ({strength})\n"
+                                    f"Recommended: {rec.upper()}\n"
+                                    f"Asset: {asset_label}")
+            except Exception as exc:
+                adx_text = f"ADX error: {exc}"
+        await query.edit_message_text(
+            adx_text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:analyze":
+        await query.edit_message_text("\u23f3 Analysing trades...")
+        text = _build_analysis(user_id)
+        if len(text) > 4000:
+            text = text[:3990] + "\n...(truncated)"
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:recommend":
+        await query.edit_message_text("\u23f3 Building recommendations...")
+        rows = _read_trades(user_id)
+        if len(rows) < 5:
+            text = f"Not enough data ({len(rows)} trades). Need at least 5."
+        else:
+            lines = ["\U0001f4cb Recommendations\n"]
+            sorted_assets = sorted(
+                [(lbl, w, t) for lbl, (w, t) in _group_win_rate(rows, lambda r: r.get("asset","?")).items() if t >= 3],
+                key=lambda x: x[1]/x[2], reverse=True,
+            )
+            if sorted_assets:
+                lines.append("Best asset: " + sorted_assets[0][0])
+            sorted_times = sorted(
+                [(lbl, w, t) for lbl, (w, t) in _group_win_rate(rows, _hour_window).items() if t >= 3],
+                key=lambda x: x[1]/x[2], reverse=True,
+            )
+            if sorted_times:
+                lines.append("Best time:  " + sorted_times[0][0])
+            text = "\n".join(lines)
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:paper":
+        ps      = _get_user_settings(user_id)
+        balance = float(ps.get("paper_balance", PAPER_START_BALANCE))
+        rows    = _read_paper_trades(user_id)
+        total   = len(rows)
+        wins    = sum(1 for r in rows if r.get("result") == "win")
+        pnl     = sum(float(r.get("pnl", 0)) for r in rows)
+        wr      = f"{wins/total*100:.1f}%" if total else "—"
+        await query.edit_message_text(
+            f"\U0001f4b0 Paper Trading\n\n"
+            f"Balance: ${balance:.2f}\n"
+            f"P&L: {'+' if pnl >= 0 else ''}{pnl:.2f}$\n"
+            f"Trades: {total}  Win rate: {wr}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f504 Reset Balance", callback_data="menu:paper_reset")],
+                [InlineKeyboardButton("\U0001f519 Back",          callback_data="menu:back")],
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:paper_reset":
+        ps = _get_user_settings(user_id)
+        ps["paper_balance"] = PAPER_START_BALANCE
+        _save_user_persistent_settings()
+        await query.edit_message_text(
+            f"\u2705 Paper balance reset to ${PAPER_START_BALANCE:.2f}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:validation":
+        rows  = _read_validations(user_id)
+        total = len(rows)
+        wins  = sum(1 for r in rows if r.get("result") == "win")
+        wr    = f"{wins/total*100:.1f}%" if total else "—"
+        last5 = "  ".join(("✅" if r.get("result")=="win" else "❌") for r in rows[-5:]) or "—"
+        ps    = _get_user_settings(user_id)
+        av    = ps.get("auto_validate", True)
+        await query.edit_message_text(
+            f"\U0001f50d Validation\n\n"
+            f"Auto-validate: {'ON \u2705' if av else 'OFF \U0001f515'}\n"
+            f"Total: {total}  Win rate: {wr}\n"
+            f"Last 5: {last5}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Toggle Auto-Validate", callback_data="menu:toggle_autovalidate")],
+                [InlineKeyboardButton("\U0001f519 Back",      callback_data="menu:back")],
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:toggle_autovalidate":
+        ps = _get_user_settings(user_id)
+        ps["auto_validate"] = not ps.get("auto_validate", True)
+        _save_user_persistent_settings()
+        state = "ON \u2705" if ps["auto_validate"] else "OFF \U0001f515"
+        await query.edit_message_text(
+            f"\U0001f50d Auto-Validate: {state}",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:manual_trades":
+        rows = _read_trades(user_id)
+        if not rows:
+            text = "No trades logged yet. Mark signals with \U0001f44d/\U0001f44e."
+        else:
+            last_5 = rows[-5:]
+            lines  = ["\U0001f4cb Last 5 Trades\n"]
+            for r in reversed(last_5):
+                icon = "\u2705" if r.get("result") == "win" else "\u274c"
+                lines.append(f"{icon} {r.get('timestamp','')[:16]}  {r.get('asset','')}  {r.get('direction','')}")
+            lines.append(f"\nTotal: {len(rows)}")
+            text = "\n".join(lines)
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:export":
+        path = _csv_path(user_id)
+        if not os.path.exists(path):
+            await query.edit_message_text(
+                "No trades recorded yet.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+                ]),
+            )
+        else:
+            await query.edit_message_text("Sending your trade log...")
+            try:
+                with open(path, "rb") as f:
+                    await telegram_app.bot.send_document(
+                        chat_id=query.message.chat_id,
+                        document=f,
+                        filename=f"trades_{user_id}.csv",
+                        caption=f"\U0001f4c1 Trade log — {len(_read_trades(user_id))} trades",
+                    )
+            except Exception as exc:
+                await telegram_app.bot.send_message(chat_id=query.message.chat_id, text=f"Export error: {exc}")
+            await query.edit_message_text(
+                "File sent above.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("\U0001f519 Back", callback_data="menu:back")]
+                ]),
+            )
         return ConversationHandler.END
 
     # ── Settings sub-menu ────────────────────────────────────────────────
