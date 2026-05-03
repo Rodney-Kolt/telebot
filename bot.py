@@ -3307,6 +3307,7 @@ async def follow_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query   = update.callback_query
     await query.answer("Starting live price tracking...")
     data    = query.data   # "follow:{signal_id}"
+    logger.info(f"follow_handler triggered: {data}")
     parts   = data.split(":", 1)
     if len(parts) != 2:
         return
@@ -4123,20 +4124,21 @@ async def manual_trades_command(update: Update, context: ContextTypes.DEFAULT_TY
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
-        CallbackQueryHandler(button_handler, pattern="^(?!vote:)"),
+        CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:)"),
     ],
     states={
-        CHOOSE_ASSET: [CallbackQueryHandler(button_handler, pattern="^(?!vote:)")],
-        CHOOSE_TIME:  [CallbackQueryHandler(button_handler, pattern="^(?!vote:)")],
+        CHOOSE_ASSET: [CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:)")],
+        CHOOSE_TIME:  [CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:)")],
     },
     fallbacks=[CommandHandler("start", start)],
     per_message=False,
 )
 
-telegram_app.add_handler(conv_handler)
+# Vote and follow handlers registered BEFORE conv_handler so they take priority
 telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler, pattern="^vote:noop$"))
 telegram_app.add_handler(CallbackQueryHandler(vote_handler,      pattern="^vote:(win|loss):"))
 telegram_app.add_handler(CallbackQueryHandler(follow_handler,    pattern="^follow:"))
+telegram_app.add_handler(conv_handler)
 telegram_app.add_handler(CommandHandler("signal",             signal_command))
 telegram_app.add_handler(CommandHandler("stats",              stats_command))
 telegram_app.add_handler(CommandHandler("analyze",            analyze_command))
