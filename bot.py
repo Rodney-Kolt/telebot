@@ -66,12 +66,23 @@ CHOOSE_ASSET, CHOOSE_TIME = range(2)
 # Asset catalogue
 # ---------------------------------------------------------------------------
 ASSETS: dict[str, str] = {
+    # ── Major OTC pairs ──────────────────────────────────────────────────
     "EUR/USD (OTC)": "EURUSD_otc",
     "AUD/USD (OTC)": "AUDUSD_otc",
     "USD/JPY (OTC)": "USDJPY_otc",
     "GBP/USD (OTC)": "GBPUSD_otc",
     "USD/CAD (OTC)": "USDCAD_otc",
     "EUR/JPY (OTC)": "EURJPY_otc",
+    # ── Emerging market exotic pairs ─────────────────────────────────────
+    "USD/ZAR (OTC)": "USDZARUSD_otc",
+    "USD/TRY (OTC)": "USDTRY_otc",
+    "USD/MXN (OTC)": "USDMXN_otc",
+    "USD/INR (OTC)": "USDINR_otc",
+    "USD/BRL (OTC)": "USDBRL_otc",
+    "USD/IDR (OTC)": "USDIDR_otc",
+    # ── Minor exotic crosses ─────────────────────────────────────────────
+    "EUR/TRY (OTC)": "EURTRY_otc",
+    "GBP/ZAR (OTC)": "GBPZAR_otc",
 }
 
 TIMEFRAMES: dict[str, int] = {
@@ -351,10 +362,11 @@ def _get_user_persistent(chat_id: int) -> dict:
         }
     # Back-fill keys added in later versions
     ps = user_persistent_settings[key]
-    ps.setdefault("strategy",  "trend")
-    ps.setdefault("auto",      False)
-    ps.setdefault("asset",     "EUR/USD (OTC)")
-    ps.setdefault("timeframe", "1 minute")
+    ps.setdefault("strategy",      "trend")
+    ps.setdefault("auto",          False)
+    ps.setdefault("asset",         "EUR/USD (OTC)")
+    ps.setdefault("timeframe",     "1 minute")
+    ps.setdefault("auto_strategy", True)   # ADX-based auto strategy selection
     return ps
 
 
@@ -1020,6 +1032,82 @@ def calculate_bollinger_bands(
     return middle, upper, lower
 
 
+def calculate_adx(
+    high: list[float],
+    low:  list[float],
+    close: list[float],
+    period: int = 14,
+) -> float | None:
+    """
+    Pure-Python Average Directional Index (ADX) using Wilder smoothing.
+
+    Returns a float 0-100, or None if there is not enough data.
+    ADX > 25 → strong trend   (prefer MACD+RSI)
+    ADX < 20 → ranging market (prefer Bollinger reversal)
+
+    Parameters
+    ----------
+    high, low, close : price lists (oldest → newest), equal length
+    period           : smoothing period (default 14)
+    """
+    n = len(close)
+    if n < period + 1 or len(high) < n or len(low) < n:
+        return None
+
+    # True Range and Directional Movement
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, n):
+        h, l, pc = high[i], low[i], close[i - 1]
+        tr  = max(h - l, abs(h - pc), abs(l - pc))
+        pdm = max(high[i] - high[i - 1], 0) if (high[i] - high[i - 1]) > (low[i - 1] - low[i]) else 0
+        ndm = max(low[i - 1] - low[i], 0)   if (low[i - 1] - low[i]) > (high[i] - high[i - 1]) else 0
+        tr_list.append(tr)
+        pdm_list.append(pdm)
+        ndm_list.append(ndm)
+
+    if len(tr_list) < period:
+        return None
+
+    # Wilder smoothing (initial sum then rolling)
+    def _wilder(values: list[float], p: int) -> list[float]:
+        smoothed = [sum(values[:p])]
+        for v in values[p:]:
+            smoothed.append(smoothed[-1] - smoothed[-1] / p + v)
+        return smoothed
+
+    atr  = _wilder(tr_list,  period)
+    pdi  = _wilder(pdm_list, period)
+    ndi  = _wilder(ndm_list, period)
+
+    # DX and ADX
+    dx_list = []
+    for a, p, nd in zip(atr, pdi, ndi):
+        if a == 0:
+            continue
+        pdi_val = 100 * p / a
+        ndi_val = 100 * nd / a
+        denom   = pdi_val + ndi_val
+        dx_list.append(100 * abs(pdi_val - ndi_val) / denom if denom else 0)
+
+    if len(dx_list) < period:
+        return None
+
+    # ADX = Wilder smoothed DX
+    adx_series = _wilder(dx_list, period)
+    return round(adx_series[-1], 2)
+
+
+def _adx_strategy_recommendation(adx: float | None) -> str:
+    """Return the recommended strategy name based on ADX value."""
+    if adx is None:
+        return "trend"   # default when not enough data
+    if adx > 25:
+        return "trend"
+    if adx < 20:
+        return "reversal"
+    return "trend"       # weak zone — default to trend
+
+
 def compute_signal_bollinger(
     candles: list,
     timeframe_seconds: int = 60,
@@ -1503,9 +1591,12 @@ async def _user_poll_loop(us: UserSession) -> None:
 
 async def _fetch_signal(asset_code: str, tf_seconds: int,
                         us: "UserSession | None" = None,
-                        strategy: str = "trend") -> dict:
+                        strategy: str = "trend",
+                        chat_id: int = 0) -> dict:
     """
     Fetch candles and compute a signal using the specified strategy.
+
+    If the user has auto_strategy=True, ADX overrides the manual strategy choice.
 
     strategy: "trend"    → MACD+RSI (default)
               "reversal" → Bollinger Bands reversal
@@ -1515,21 +1606,48 @@ async def _fetch_signal(asset_code: str, tf_seconds: int,
         return {
             "direction": "WAIT", "confidence": 0,
             "rsi": None, "reason": "Not connected to Pocket Option",
-            "market": "Unknown",
+            "market": "Unknown", "adx": None, "effective_strategy": strategy,
         }
     try:
         candles = await sm.get_candles(
             asset=asset_code, timeframe=tf_seconds, count=CANDLE_COUNT
         )
-        if strategy == "reversal":
-            return compute_signal_bollinger(candles, tf_seconds)
-        return compute_signal_advanced(candles, tf_seconds)
+
+        # ── ADX auto-strategy override ────────────────────────────────────
+        adx_val = None
+        effective_strategy = strategy
+        if candles and len(candles) >= 16:
+            highs  = [float(c["high"]  if isinstance(c, dict) else c.high)  for c in candles]
+            lows   = [float(c["low"]   if isinstance(c, dict) else c.low)   for c in candles]
+            closes = _closes(candles)
+            adx_val = calculate_adx(highs, lows, closes)
+
+            # Apply ADX override if user has auto_strategy enabled
+            if chat_id:
+                ps = _get_user_settings(chat_id)
+                if ps.get("auto_strategy", True) and adx_val is not None:
+                    effective_strategy = _adx_strategy_recommendation(adx_val)
+                    if effective_strategy != strategy:
+                        logger.info(
+                            f"ADX={adx_val:.1f} → auto-switching strategy "
+                            f"{strategy} → {effective_strategy} for {asset_code}"
+                        )
+
+        if effective_strategy == "reversal":
+            result = compute_signal_bollinger(candles, tf_seconds)
+        else:
+            result = compute_signal_advanced(candles, tf_seconds)
+
+        result["adx"]                = adx_val
+        result["effective_strategy"] = effective_strategy
+        return result
+
     except Exception as exc:
         log_error(f"_fetch_signal error: {exc}")
         return {
             "direction": "WAIT", "confidence": 0,
             "rsi": None, "reason": f"Error: {exc}",
-            "market": "Unknown",
+            "market": "Unknown", "adx": None, "effective_strategy": strategy,
         }
 
 
@@ -1554,13 +1672,17 @@ def _format_signal(result: dict, asset_label: str, tf_label: str) -> str:
     rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
     filled  = round(confidence / 20)
     bar     = "\u2588" * filled + "\u2591" * (5 - filled)
+    adx_val = result.get("adx")
+    adx_str = f"{adx_val:.1f}" if adx_val is not None else "N/A"
+    eff_strat = result.get("effective_strategy", result.get("strategy", ""))
+    strat_tag = f" [{eff_strat}]" if eff_strat else ""
 
     return (
         f"{header}\n\n"
         f"Asset: {asset_label}\n"
         f"Timeframe: {tf_label}\n"
         f"Reliability: {confidence}%  {bar}\n"
-        f"RSI: {rsi_str}\n"
+        f"RSI: {rsi_str}  |  ADX: {adx_str}{strat_tag}\n"
         f"Market: {market}\n"
         f"Reason: {reason}\n"
         f"Time: {datetime.now().strftime('%H:%M:%S')}"
@@ -1581,6 +1703,8 @@ def _signal_caption(result: dict, asset_label: str, tf_label: str,
 
     action  = "BUY" if direction == "HIGHER" else "SELL"
     rsi_str = f"{rsi:.1f}" if rsi is not None else "N/A"
+    adx_val = result.get("adx")
+    adx_str = f"{adx_val:.1f}" if adx_val is not None else "N/A"
     filled  = round(confidence / 20)
     bar     = "\u2588" * filled + "\u2591" * (5 - filled)
 
@@ -1593,7 +1717,7 @@ def _signal_caption(result: dict, asset_label: str, tf_label: str,
         lines.append(f"Price: {price_str}")
     lines += [
         f"Reliability: {confidence}%  {bar}",
-        f"RSI: {rsi_str}",
+        f"RSI: {rsi_str}  |  ADX: {adx_str}",
         f"Market: {market}",
         f"Reason: {reason}",
         f"Time: {datetime.now().strftime('%H:%M:%S')}",
@@ -1754,6 +1878,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "\nTap a button below, or use these commands:\n"
         "/signal \u2014 latest signal\n"
         "/strategy \u2014 switch between trend / reversal\n"
+        "/adx \u2014 current ADX value + recommended strategy\n"
+        "/autostrategy on|off \u2014 let ADX choose strategy automatically\n"
+        "/recommend \u2014 best assets, windows & strategy from your history\n"
         "/stats \u2014 your win/loss statistics\n"
         "/analyze \u2014 detailed trade analytics\n"
         "/analyze --refresh \u2014 recompute best time window\n"
@@ -1919,7 +2046,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
         result = await _fetch_signal(asset_code, tf_seconds, us,
-                                     strategy=settings.get("strategy", "trend"))
+                                     strategy=settings.get("strategy", "trend"),
+                                     chat_id=chat_id)
 
         if result["direction"] == "WAIT":
             await query.edit_message_text(
@@ -1971,7 +2099,9 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     user_strategy = ps.get("strategy", "trend")
-    result = await _fetch_signal(asset_code, tf_seconds, us, strategy=user_strategy)
+    result = await _fetch_signal(asset_code, tf_seconds, us,
+                                 strategy=user_strategy,
+                                 chat_id=update.effective_chat.id)
 
     # News filter check for manual signals too
     if result["direction"] != "WAIT" and _news_filter_active(update.effective_chat.id):
@@ -2621,6 +2751,171 @@ async def autotime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     else:
         await update.message.reply_text("Usage: /autotime on  or  /autotime off")
 
+@_require_auth
+async def adx_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current ADX value and recommended strategy for the user's asset."""
+    us      = _get_user_session(update.effective_chat.id)
+    ps      = _get_user_settings(update.effective_chat.id)
+    asset_label = ps.get("asset", DEFAULT_SETTINGS["asset"])
+    tf_label    = ps.get("timeframe", DEFAULT_SETTINGS["timeframe"])
+    asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
+    tf_seconds  = TIMEFRAMES.get(tf_label, 60)
+
+    sm = us.session_manager if us else None
+    if not (sm and sm.is_connected):
+        await update.message.reply_text("Not connected to Pocket Option.")
+        return
+
+    await update.message.reply_text(f"\u23f3 Calculating ADX for {asset_label}...")
+    try:
+        candles = await sm.get_candles(asset=asset_code, timeframe=tf_seconds, count=CANDLE_COUNT)
+        if not candles or len(candles) < 16:
+            await update.message.reply_text("Not enough candle data for ADX.")
+            return
+
+        highs  = [float(c["high"]  if isinstance(c, dict) else c.high)  for c in candles]
+        lows   = [float(c["low"]   if isinstance(c, dict) else c.low)   for c in candles]
+        closes = _closes(candles)
+        adx    = calculate_adx(highs, lows, closes)
+
+        if adx is None:
+            await update.message.reply_text("Could not compute ADX — not enough data.")
+            return
+
+        rec    = _adx_strategy_recommendation(adx)
+        auto_on = ps.get("auto_strategy", True)
+
+        strength = ("Strong trend \U0001f4c8" if adx > 25
+                    else "Ranging market \u27a1\ufe0f" if adx < 20
+                    else "Weak trend \u26a0\ufe0f")
+
+        await update.message.reply_text(
+            f"\U0001f4ca ADX Analysis — {asset_label}\n\n"
+            f"ADX: {adx:.1f}  ({strength})\n"
+            f"Recommended strategy: {rec.upper()}\n"
+            f"Auto-strategy: {'ON \u2705' if auto_on else 'OFF \U0001f515'}\n\n"
+            "ADX > 25 \u2192 TREND (MACD+RSI)\n"
+            "ADX < 20 \u2192 REVERSAL (Bollinger)\n"
+            "20-25    \u2192 Weak zone (defaults to TREND)\n\n"
+            "Use /autostrategy on|off to toggle ADX auto-switching."
+        )
+    except Exception as exc:
+        await update.message.reply_text(f"ADX error: {exc}")
+
+
+@_require_auth
+async def autostrategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle ADX-based automatic strategy selection."""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1:
+            args = parts[1:]
+
+    if not args:
+        enabled = ps.get("auto_strategy", True)
+        manual  = ps.get("strategy", "trend")
+        await update.message.reply_text(
+            f"ADX Auto-Strategy: {'ON \u2705' if enabled else 'OFF \U0001f515'}\n"
+            f"Manual strategy: {manual}\n\n"
+            "When ON, ADX overrides your manual strategy:\n"
+            "  ADX > 25 \u2192 TREND (MACD+RSI)\n"
+            "  ADX < 20 \u2192 REVERSAL (Bollinger)\n\n"
+            "Commands:\n"
+            "  /autostrategy on\n"
+            "  /autostrategy off\n"
+            "  /adx \u2014 see current ADX value"
+        )
+        return
+
+    arg = args[0].lower()
+    if arg == "on":
+        ps["auto_strategy"] = True
+        _save_user_persistent_settings()
+        await update.message.reply_text(
+            "\u2705 ADX Auto-Strategy ENABLED\n"
+            "The bot will automatically use TREND or REVERSAL based on ADX strength."
+        )
+    elif arg == "off":
+        ps["auto_strategy"] = False
+        _save_user_persistent_settings()
+        await update.message.reply_text(
+            f"\U0001f515 ADX Auto-Strategy DISABLED\n"
+            f"Using manual strategy: {ps.get('strategy','trend').upper()}\n"
+            "Change with /strategy trend or /strategy reversal."
+        )
+    else:
+        await update.message.reply_text("Usage: /autostrategy on  or  /autostrategy off")
+
+
+@_require_auth
+async def recommend_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Analyse trade history and recommend best assets, windows, and strategy."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("\u23f3 Analysing your trade history...")
+
+    rows = _read_trades(chat_id)
+    if len(rows) < 5:
+        await update.message.reply_text(
+            f"Not enough data ({len(rows)} trades). "
+            "Need at least 5 trades with \U0001f44d/\U0001f44e results."
+        )
+        return
+
+    lines = ["\U0001f4cb Trade Recommendations\n"]
+
+    # ── Best assets ───────────────────────────────────────────────────────
+    asset_groups = _group_win_rate(rows, lambda r: r.get("asset", "?"))
+    lines.append("\U0001f4c8 Best assets:")
+    sorted_assets = sorted(
+        [(lbl, w, t) for lbl, (w, t) in asset_groups.items() if t >= 3],
+        key=lambda x: x[1] / x[2], reverse=True,
+    )
+    if sorted_assets:
+        for lbl, w, t in sorted_assets[:5]:
+            wr  = w / t * 100
+            bar = "\u2588" * round(wr / 20) + "\u2591" * (5 - round(wr / 20))
+            lines.append(f"  {lbl}: {w}/{t} ({wr:.0f}%) {bar}")
+    else:
+        lines.append("  Not enough data per asset yet.")
+
+    # ── Best time windows ─────────────────────────────────────────────────
+    lines.append("\n\u23f0 Best time windows (UTC):")
+    sorted_times = sorted(
+        [(lbl, w, t) for lbl, (w, t) in _group_win_rate(rows, _hour_window).items() if t >= 3],
+        key=lambda x: x[1] / x[2], reverse=True,
+    )
+    if sorted_times:
+        for lbl, w, t in sorted_times[:3]:
+            lines.append(f"  {lbl}: {w}/{t} ({w/t*100:.0f}%)")
+    else:
+        lines.append("  Not enough data per window yet.")
+
+    # ── Strategy performance ──────────────────────────────────────────────
+    lines.append("\n\U0001f9e0 Strategy performance:")
+    macd_rows = [r for r in rows if "MACD" in r.get("reason","") or "EMA" in r.get("reason","")]
+    bb_rows   = [r for r in rows if "BB" in r.get("reason","") or "band" in r.get("reason","").lower()]
+    if macd_rows:
+        lines.append(f"  TREND (MACD+RSI): {len(macd_rows)} trades, {_win_rate(macd_rows):.0f}% win rate")
+    if bb_rows:
+        lines.append(f"  REVERSAL (BB):    {len(bb_rows)} trades, {_win_rate(bb_rows):.0f}% win rate")
+    if not macd_rows and not bb_rows:
+        lines.append("  Not enough strategy-tagged data yet.")
+
+    # ── Top recommendation ────────────────────────────────────────────────
+    lines.append("\n\u2b50 Top recommendation:")
+    if sorted_assets:
+        lines.append(f"  Best asset: {sorted_assets[0][0]}")
+    if sorted_times:
+        lines.append(f"  Best time:  {sorted_times[0][0]}")
+        lines.append(f"  Tip: /autotime on to restrict to {sorted_times[0][0]}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
@@ -2643,6 +2938,9 @@ telegram_app.add_handler(CommandHandler("analyze",            analyze_command))
 telegram_app.add_handler(CommandHandler("export",             export_command))
 telegram_app.add_handler(CommandHandler("strategy",           strategy_command))
 telegram_app.add_handler(CommandHandler("autotime",           autotime_command))
+telegram_app.add_handler(CommandHandler("adx",                adx_command))
+telegram_app.add_handler(CommandHandler("autostrategy",       autostrategy_command))
+telegram_app.add_handler(CommandHandler("recommend",          recommend_command))
 telegram_app.add_handler(CommandHandler("restrict_window",    restrict_window_command))
 telegram_app.add_handler(CommandHandler("clear_restriction",  clear_restriction_command))
 telegram_app.add_handler(CommandHandler("enable_news_filter",  enable_news_filter_command))
