@@ -85,6 +85,7 @@ DEFAULT_SETTINGS = {
     "asset":     "EUR/USD (OTC)",
     "timeframe": "1 minute",
     "auto":      False,
+    "strategy":  "trend",    # "trend" = MACD+RSI  |  "reversal" = Bollinger Bands
 }
 
 # Error substrings that indicate the SSID is dead and needs manual refresh
@@ -338,6 +339,10 @@ def _get_user_persistent(chat_id: int) -> dict:
             "best_window_start":       None,
             "best_window_end":         None,
             "news_filter_enabled":     True,   # ON by default
+            "restrict_to_best_time":   False,  # /autotime on|off
+            "best_time_start":         None,   # computed from CSV
+            "best_time_end":           None,
+            "best_time_updated":       None,   # ISO date of last refresh
         }
     return user_persistent_settings[str(chat_id)]
 
@@ -966,6 +971,152 @@ def calculate_macd(
     return macd_val, signal_val, hist_val
 
 
+def calculate_bollinger_bands(
+    closes: list[float],
+    period: int = 20,
+    std_dev: float = 2.0,
+) -> tuple[float | None, float | None, float | None]:
+    """
+    Pure-Python Bollinger Bands calculation.
+
+    Returns (middle, upper, lower) using the most recent `period` closes,
+    or (None, None, None) if there is not enough data.
+
+    Parameters
+    ----------
+    closes  : list of closing prices (oldest → newest)
+    period  : SMA period (default 20)
+    std_dev : number of standard deviations for the bands (default 2)
+    """
+    if len(closes) < period:
+        return None, None, None
+
+    window = closes[-period:]
+    middle = sum(window) / period
+    variance = sum((x - middle) ** 2 for x in window) / period
+    sd = variance ** 0.5
+
+    upper = middle + std_dev * sd
+    lower = middle - std_dev * sd
+    return middle, upper, lower
+
+
+def compute_signal_bollinger(
+    candles: list,
+    timeframe_seconds: int = 60,
+) -> dict:
+    """
+    Bollinger Bands reversal strategy.
+
+    CALL when:
+      - Previous close < lower band AND current close >= lower band (price bouncing up)
+      - AND RSI < 45 (confirms oversold)
+
+    PUT when:
+      - Previous close > upper band AND current close <= upper band (price bouncing down)
+      - AND RSI > 55 (confirms overbought)
+
+    Confidence is based on how far the price penetrated outside the band.
+
+    Returns the same dict shape as compute_signal_advanced.
+    """
+    result = {
+        "direction":   "WAIT",
+        "confidence":  0,
+        "rsi":         None,
+        "macd":        None,
+        "macd_signal": None,
+        "histogram":   None,
+        "reason":      "Not enough data",
+        "market":      "Unknown",
+        "strategy":    "Bollinger Reversal",
+    }
+
+    if not candles or len(candles) < 22:   # need 20 for BB + 2 for prev/curr
+        return result
+
+    closes = _closes(candles)
+    rsi    = _rsi(closes, 14)
+    market = _market_condition(candles)
+
+    result["rsi"]    = rsi
+    result["market"] = market
+
+    if rsi is None:
+        result["reason"] = "Insufficient RSI data"
+        return result
+
+    middle, upper, lower = calculate_bollinger_bands(closes, period=20, std_dev=2.0)
+    if middle is None:
+        result["reason"] = "Insufficient Bollinger Bands data"
+        return result
+
+    curr_close = closes[-1]
+    prev_close = closes[-2]
+    band_width = upper - lower if upper != lower else 1e-10
+
+    logger.debug(
+        f"BB Reversal | RSI={rsi:.1f} | Price={curr_close:.5f} "
+        f"| Upper={upper:.5f} | Lower={lower:.5f} | Middle={middle:.5f}"
+    )
+
+    direction  = "WAIT"
+    confidence = 0
+    reason     = ""
+
+    # ── CALL: price bouncing off lower band ──────────────────────────────
+    if prev_close < lower and curr_close >= lower and rsi < 45:
+        direction = "HIGHER"
+        # How far below the band the previous candle was (as % of band width)
+        penetration = (lower - prev_close) / band_width
+        conf_pts    = min(25, penetration * 500)   # scale to 0-25 pts
+        rsi_pts     = max(0, (45 - rsi) / 45) * 10
+        confidence  = min(95, max(60, int(65 + conf_pts + rsi_pts)))
+        reason = (
+            f"Price bounced off lower BB ({lower:.5f}), "
+            f"RSI={rsi:.1f} (oversold), penetration={penetration:.3f}"
+        )
+
+    # ── PUT: price bouncing off upper band ───────────────────────────────
+    elif prev_close > upper and curr_close <= upper and rsi > 55:
+        direction = "LOWER"
+        penetration = (prev_close - upper) / band_width
+        conf_pts    = min(25, penetration * 500)
+        rsi_pts     = max(0, (rsi - 55) / 45) * 10
+        confidence  = min(95, max(60, int(65 + conf_pts + rsi_pts)))
+        reason = (
+            f"Price bounced off upper BB ({upper:.5f}), "
+            f"RSI={rsi:.1f} (overbought), penetration={penetration:.3f}"
+        )
+
+    else:
+        # Explain why no signal
+        if rsi < 45 and curr_close > lower:
+            reason = f"RSI={rsi:.1f} oversold but price not touching lower BB ({lower:.5f})"
+        elif rsi > 55 and curr_close < upper:
+            reason = f"RSI={rsi:.1f} overbought but price not touching upper BB ({upper:.5f})"
+        else:
+            reason = (
+                f"Price within bands (L={lower:.5f} M={middle:.5f} U={upper:.5f}), "
+                f"RSI={rsi:.1f} — no reversal signal"
+            )
+        result["reason"] = reason
+        return result
+
+    # Timeframe noise penalty
+    if timeframe_seconds <= 5:
+        confidence = max(55, confidence - 8)
+    elif timeframe_seconds <= 15:
+        confidence = max(55, confidence - 4)
+
+    result.update({
+        "direction":  direction,
+        "confidence": confidence,
+        "reason":     reason,
+    })
+    return result
+
+
 def _market_condition(candles: list) -> str:
     """Classify market as Trending, Ranging, or Volatile."""
     if len(candles) < 10:
@@ -1185,9 +1336,12 @@ def compute_signal_advanced(
     return result
 
 
-def compute_signal(candles: list) -> tuple[str, str]:
+def compute_signal(candles: list, strategy: str = "trend") -> tuple[str, str]:
     """Legacy wrapper used by the auto-broadcast loop."""
-    r = compute_signal_advanced(candles)
+    if strategy == "reversal":
+        r = compute_signal_bollinger(candles)
+    else:
+        r = compute_signal_advanced(candles)
     if r["direction"] == "HIGHER":
         return "CALL \u2705", r["reason"]
     if r["direction"] == "LOWER":
@@ -1221,12 +1375,14 @@ async def _user_poll_loop(us: UserSession) -> None:
                 asset=TRADE_ASSET, timeframe=CANDLE_PERIOD, count=CANDLE_COUNT
             )
 
-            direction, reason = compute_signal(candles)
+            user_strategy = us.settings.get("strategy", "trend")
+            direction, reason = compute_signal(candles, strategy=user_strategy)
             price = None
             if candles:
                 try:
-                    price = float(candles[-1].close)
-                except (AttributeError, TypeError, ValueError):
+                    c = candles[-1]
+                    price = float(c["close"] if isinstance(c, dict) else c.close)
+                except (AttributeError, TypeError, ValueError, KeyError):
                     pass
 
             us.latest_signal = {
@@ -1237,7 +1393,10 @@ async def _user_poll_loop(us: UserSession) -> None:
             }
 
             if direction != "WAIT \u23f8" and us.settings.get("auto", False):
-                result    = compute_signal_advanced(candles)
+                if user_strategy == "reversal":
+                    result = compute_signal_bollinger(candles, CANDLE_PERIOD)
+                else:
+                    result = compute_signal_advanced(candles, CANDLE_PERIOD)
                 price_str = f"{price:.5f}" if price else "N/A"
 
                 # Refresh calendar cache if stale (non-blocking)
@@ -1248,7 +1407,19 @@ async def _user_poll_loop(us: UserSession) -> None:
                 for cid in us.all_broadcast_ids():
                     ps = _get_user_persistent(cid)
 
-                    # ── Time-window restriction ───────────────────────────
+                    # ── restrict_to_best_time (/autotime on) ─────────────
+                    if ps.get("restrict_to_best_time"):
+                        ts = ps.get("best_time_start")
+                        te = ps.get("best_time_end")
+                        if ts is not None and te is not None:
+                            if not (ts <= current_hour < te):
+                                logger.debug(
+                                    f"[{us.name}] Silent skip for {cid} "
+                                    f"— outside best time {ts:02d}-{te:02d} UTC"
+                                )
+                                continue   # silent skip, no message
+
+                    # ── Legacy restrict_to_best_window ───────────────────
                     if ps.get("restrict_to_best_window"):
                         ws = ps.get("best_window_start")
                         we = ps.get("best_window_end")
@@ -1259,7 +1430,7 @@ async def _user_poll_loop(us: UserSession) -> None:
 
                     # ── News filter ───────────────────────────────────────
                     if _news_filter_active(cid):
-                        asset_label = "EUR/USD (OTC)"   # default auto-signal asset
+                        asset_label = "EUR/USD (OTC)"
                         blocked, event_desc = is_high_impact_news_approaching(asset_label)
                         if blocked:
                             logger.info(f"[{us.name}] Signal paused for {cid} — {event_desc}")
@@ -1298,7 +1469,14 @@ async def _user_poll_loop(us: UserSession) -> None:
 # ---------------------------------------------------------------------------
 
 async def _fetch_signal(asset_code: str, tf_seconds: int,
-                        us: "UserSession | None" = None) -> dict:
+                        us: "UserSession | None" = None,
+                        strategy: str = "trend") -> dict:
+    """
+    Fetch candles and compute a signal using the specified strategy.
+
+    strategy: "trend"    → MACD+RSI (default)
+              "reversal" → Bollinger Bands reversal
+    """
     sm = us.session_manager if us else None
     if not (sm and sm.is_connected):
         return {
@@ -1310,6 +1488,8 @@ async def _fetch_signal(asset_code: str, tf_seconds: int,
         candles = await sm.get_candles(
             asset=asset_code, timeframe=tf_seconds, count=CANDLE_COUNT
         )
+        if strategy == "reversal":
+            return compute_signal_bollinger(candles, tf_seconds)
         return compute_signal_advanced(candles, tf_seconds)
     except Exception as exc:
         log_error(f"_fetch_signal error: {exc}")
@@ -1539,8 +1719,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text += (
         "\nTap a button below, or use these commands:\n"
         "/signal \u2014 latest signal\n"
+        "/strategy \u2014 switch between trend / reversal\n"
         "/stats \u2014 your win/loss statistics\n"
         "/analyze \u2014 detailed trade analytics\n"
+        "/analyze --refresh \u2014 recompute best time window\n"
+        "/autotime on|off \u2014 restrict signals to your best hours\n"
         "/export \u2014 download your trade log (CSV)\n"
         "/restrict_window \u2014 only receive signals in your best hours\n"
         "/clear_restriction \u2014 remove time-window filter\n"
@@ -1698,7 +1881,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"\u23f3 Fetching signal for {asset_label} / {tf_label}..."
         )
 
-        result = await _fetch_signal(asset_code, tf_seconds, us)
+        result = await _fetch_signal(asset_code, tf_seconds, us,
+                                     strategy=settings.get("strategy", "trend"))
 
         if result["direction"] == "WAIT":
             await query.edit_message_text(
@@ -1748,7 +1932,8 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"\u23f3 Fetching signal for {asset_label} / {tf_label}..."
     )
 
-    result = await _fetch_signal(asset_code, tf_seconds, us)
+    user_strategy = us.settings.get("strategy", "trend")
+    result = await _fetch_signal(asset_code, tf_seconds, us, strategy=user_strategy)
 
     # News filter check for manual signals too
     if result["direction"] != "WAIT" and _news_filter_active(update.effective_chat.id):
@@ -2088,11 +2273,34 @@ async def vote_noop_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 @_require_auth
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show detailed trade analytics from the user's CSV log."""
+    """Show detailed trade analytics from the user's CSV log.
+    Use /analyze --refresh to also recompute and save the best time window.
+    """
     chat_id = update.effective_chat.id
+    refresh = context.args and "--refresh" in context.args
+
     await update.message.reply_text("⏳ Analysing your trades...")
     text = _build_analysis(chat_id)
-    # Split if too long for one message
+
+    # Auto-save best time window on --refresh or if not yet set
+    ps = _get_user_persistent(chat_id)
+    if refresh or ps.get("best_time_start") is None:
+        rows = _read_trades(chat_id)
+        if rows:
+            best_label, best_wr = _best_window(rows)
+            if best_label:
+                try:
+                    parts = best_label.replace(" UTC", "").split("-")
+                    ts, te = int(parts[0]), int(parts[1])
+                    ps["best_time_start"]   = ts
+                    ps["best_time_end"]     = te
+                    ps["best_time_updated"] = datetime.utcnow().date().isoformat()
+                    _save_user_persistent_settings()
+                    if refresh:
+                        text += f"\n\n✅ Best time window refreshed: {best_label} ({best_wr:.0f}%)"
+                except Exception:
+                    pass
+
     if len(text) > 4000:
         for i in range(0, len(text), 4000):
             await update.message.reply_text(text[i:i+4000])
@@ -2241,9 +2449,130 @@ async def news_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("\n".join(lines))
 
 
-# ---------------------------------------------------------------------------
-# Register handlers
-# ---------------------------------------------------------------------------
+@_require_auth
+async def strategy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Switch signal strategy.
+
+    Usage:
+      /strategy          — show current strategy
+      /strategy trend    — MACD+RSI (default)
+      /strategy reversal — Bollinger Bands reversal
+    """
+    us = _get_user_session(update.effective_chat.id)
+
+    if not context.args:
+        current = us.settings.get("strategy", "trend")
+        await update.message.reply_text(
+            f"📊 Current strategy: {current}\n\n"
+            "Available strategies:\n"
+            "  /strategy trend    — MACD+RSI (requires RSI extreme + MACD confirmation)\n"
+            "  /strategy reversal — Bollinger Bands reversal (price bouncing off bands)"
+        )
+        return
+
+    chosen = context.args[0].lower()
+    if chosen not in ("trend", "reversal"):
+        await update.message.reply_text(
+            "❌ Unknown strategy. Choose:\n"
+            "  /strategy trend\n"
+            "  /strategy reversal"
+        )
+        return
+
+    us.settings["strategy"] = chosen
+    descriptions = {
+        "trend":    "MACD+RSI — signals when RSI is extreme AND MACD confirms direction",
+        "reversal": "Bollinger Bands — signals when price bounces off upper/lower band",
+    }
+    await update.message.reply_text(
+        f"✅ Strategy set to: {chosen}\n\n"
+        f"{descriptions[chosen]}\n\n"
+        "Use /signal to test it now."
+    )
+
+
+@_require_auth
+async def autotime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Toggle time-restricted auto-signals based on your best historical window.
+
+    Usage:
+      /autotime on   — only send auto-signals during your best UTC window
+      /autotime off  — send auto-signals at all hours
+      /autotime      — show current status
+    """
+    chat_id = update.effective_chat.id
+    ps      = _get_user_persistent(chat_id)
+
+    if not context.args:
+        enabled = ps.get("restrict_to_best_time", False)
+        ts      = ps.get("best_time_start")
+        te      = ps.get("best_time_end")
+        updated = ps.get("best_time_updated", "never")
+        window  = f"{ts:02d}:00–{te:02d}:00 UTC" if ts is not None else "not computed yet"
+        await update.message.reply_text(
+            f"⏰ Auto-time restriction: {'ON ✅' if enabled else 'OFF 🔕'}\n"
+            f"Best window: {window}\n"
+            f"Last refreshed: {updated}\n\n"
+            "Commands:\n"
+            "  /autotime on  — enable restriction\n"
+            "  /autotime off — disable restriction\n"
+            "  /analyze --refresh — recompute best window from your trade history"
+        )
+        return
+
+    arg = context.args[0].lower()
+
+    if arg == "on":
+        # Compute best window if not yet available
+        ts = ps.get("best_time_start")
+        te = ps.get("best_time_end")
+        if ts is None:
+            rows = _read_trades(chat_id)
+            if len(rows) < 10:
+                await update.message.reply_text(
+                    f"Not enough trade history ({len(rows)} trades). "
+                    "Need at least 10 trades with 👍/👎 results.\n"
+                    "Run /analyze --refresh after you have more data."
+                )
+                return
+            best_label, best_wr = _best_window(rows)
+            if not best_label:
+                await update.message.reply_text(
+                    "Could not determine a best window — need at least 3 trades per time slot."
+                )
+                return
+            try:
+                parts = best_label.replace(" UTC", "").split("-")
+                ts, te = int(parts[0]), int(parts[1])
+                ps["best_time_start"]   = ts
+                ps["best_time_end"]     = te
+                ps["best_time_updated"] = datetime.utcnow().date().isoformat()
+            except Exception as exc:
+                await update.message.reply_text(f"Could not parse window: {exc}")
+                return
+
+        ps["restrict_to_best_time"] = True
+        _save_user_persistent_settings()
+        await update.message.reply_text(
+            f"⏰ Auto-time restriction ENABLED ✅\n\n"
+            f"Auto-signals will only be sent between "
+            f"{ts:02d}:00 and {te:02d}:00 UTC.\n"
+            f"Outside this window, signals are silently skipped.\n\n"
+            "Use /autotime off to disable."
+        )
+
+    elif arg == "off":
+        ps["restrict_to_best_time"] = False
+        _save_user_persistent_settings()
+        await update.message.reply_text(
+            "⏰ Auto-time restriction DISABLED 🔕\n"
+            "You will now receive auto-signals at all hours."
+        )
+
+    else:
+        await update.message.reply_text("Usage: /autotime on  or  /autotime off")
 
 conv_handler = ConversationHandler(
     entry_points=[
@@ -2265,6 +2594,8 @@ telegram_app.add_handler(CommandHandler("signal",             signal_command))
 telegram_app.add_handler(CommandHandler("stats",              stats_command))
 telegram_app.add_handler(CommandHandler("analyze",            analyze_command))
 telegram_app.add_handler(CommandHandler("export",             export_command))
+telegram_app.add_handler(CommandHandler("strategy",           strategy_command))
+telegram_app.add_handler(CommandHandler("autotime",           autotime_command))
 telegram_app.add_handler(CommandHandler("restrict_window",    restrict_window_command))
 telegram_app.add_handler(CommandHandler("clear_restriction",  clear_restriction_command))
 telegram_app.add_handler(CommandHandler("enable_news_filter",  enable_news_filter_command))
