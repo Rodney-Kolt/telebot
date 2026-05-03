@@ -4616,7 +4616,13 @@ async def account_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Try server time for sync info
         try:
             server_ts  = await sm.client.get_server_time()
-            server_dt  = datetime.utcfromtimestamp(server_ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+            # get_server_time returns milliseconds on some versions — normalise
+            if server_ts and server_ts > 1_000_000_000_000:
+                server_ts = server_ts // 1000
+            if server_ts and server_ts > 1_000_000_000:
+                server_dt = datetime.utcfromtimestamp(server_ts).strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                server_dt = "unavailable"
         except Exception:
             server_dt = "unavailable"
 
