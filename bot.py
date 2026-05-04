@@ -50,7 +50,12 @@ def _load_scan_assets():
     raw = os.environ.get("SCAN_ASSETS", "").strip()
     if raw:
         return [a.strip() for a in raw.split(",") if a.strip()][:MAX_SCAN_ASSETS]
-    return ["EURUSD_otc","GBPUSD_otc","USDJPY_otc","AUDUSD_otc","EURUSD_otc","EURTRY_otc"]
+    # Default: all major OTC pairs — no duplicates
+    return [
+        "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
+        "USDCAD_otc", "EURJPY_otc", "GBPJPY_otc", "EURTRY_otc",
+        "USDINR_otc", "USDTRY_otc",
+    ]
 
 SCAN_ASSETS = _load_scan_assets()
 
@@ -80,8 +85,10 @@ known_users: set[int] = set()
 pending_signals: dict[str, dict] = {}
 # Scanner cooldowns: {f"{chat_id}:{asset}": timestamp}
 scanner_cooldowns: dict[str, float] = {}
-# Scanner tasks per UserSession
-scanner_tasks: list = []
+# Per-user last signal timestamp — enforces minimum gap between ANY signals
+user_last_signal: dict[int, float] = {}
+# Minimum gap between signals for the same user (seconds) — configurable
+SIGNAL_GAP_SECONDS = int(os.environ.get("SIGNAL_GAP", "120"))  # 2 minutes default
 # Recent errors
 recent_errors: list[str] = []
 MAX_ERRORS = 20
@@ -842,20 +849,24 @@ async def _poll_loop():
 
                 if result["direction"] != "WAIT":
                     price_str = f"{price:.5f}" if price else "N/A"
+                    now = time.time()
                     for cid in list(known_users):
                         ps = _get_settings(cid)
-                        if ps.get("auto", False):
-                            adv = _get_adv(cid)
-                            if adv.get("advanced"):
-                                # Advanced mode: only trigger if no analysis running
-                                if cid not in _analysis_tasks or _analysis_tasks[cid].done():
-                                    asyncio.create_task(
-                                        trigger_advanced_analysis(cid, "EURUSD_otc", "EUR/USD (OTC)", "1 minute"),
-                                        name=f"adv_auto_{cid}"
-                                    )
-                            else:
-                                await _send_signal_message(cid, result, "EUR/USD (OTC)",
-                                                            "1 minute", price_str)
+                        if not ps.get("auto", False): continue
+                        # Enforce signal gap
+                        if now - user_last_signal.get(cid, 0) < SIGNAL_GAP_SECONDS:
+                            continue
+                        user_last_signal[cid] = now
+                        adv = _get_adv(cid)
+                        if adv.get("advanced"):
+                            if cid not in _analysis_tasks or _analysis_tasks[cid].done():
+                                asyncio.create_task(
+                                    trigger_advanced_analysis(cid, "EURUSD_otc", "EUR/USD (OTC)", "1 minute"),
+                                    name=f"adv_auto_{cid}"
+                                )
+                        else:
+                            await _send_signal_message(cid, result, "EUR/USD (OTC)",
+                                                        "1 minute", price_str)
 
         except Exception as exc:
             log_error(f"Poll loop error: {exc}")
@@ -866,37 +877,87 @@ async def _poll_loop():
 # ---------------------------------------------------------------------------
 # Scanner loop
 # ---------------------------------------------------------------------------
-async def _scan_asset(asset_code):
-    global session_manager
-    asset_label = next((k for k,v in ASSETS.items() if v == asset_code), asset_code)
+# Scanner loop — polls each asset independently, auto-restarts on error
+# ---------------------------------------------------------------------------
+async def _scan_asset(asset_code: str) -> None:
+    """
+    Poll one asset every CANDLE_PERIOD seconds.
+    Sends signals to users who have both scanner=True and auto=True.
+    Enforces SIGNAL_GAP_SECONDS between any two signals per user.
+    Auto-restarts on error with exponential backoff.
+    """
+    asset_label = next((k for k, v in ASSETS.items() if v == asset_code), asset_code)
     logger.info(f"Scanner started for {asset_code}")
-    try:
-        from datetime import timedelta
-        sub = await session_manager.client.subscribe_symbol_timed(
-            asset_code, timedelta(seconds=CANDLE_PERIOD))
-        async for _tick in sub:
+    backoff = 5   # seconds before retry on error
+
+    while True:
+        try:
+            # Wait for connection
+            for _ in range(60):
+                if session_manager and session_manager.is_connected:
+                    break
+                await asyncio.sleep(5)
+            else:
+                await asyncio.sleep(30)
+                continue
+
+            # Check if any user has scanner enabled
             any_scanner = any(_get_settings(cid).get("scanner", False) for cid in known_users)
-            if not any_scanner: return
+            if not any_scanner:
+                await asyncio.sleep(CANDLE_PERIOD)
+                continue
+
             candles = await session_manager.get_candles(asset_code, CANDLE_PERIOD, CANDLE_COUNT)
-            if not candles or len(candles) < 22: continue
+            if not candles or len(candles) < 22:
+                await asyncio.sleep(CANDLE_PERIOD)
+                continue
+
             result = compute_signal(candles, CANDLE_PERIOD)
-            if result["direction"] == "WAIT": continue
+            if result["direction"] == "WAIT":
+                await asyncio.sleep(CANDLE_PERIOD)
+                continue
+
             now = time.time()
+            price = None
+            try:
+                c = candles[-1]
+                price = float(c["close"] if isinstance(c, dict) else c.close)
+            except Exception:
+                pass
+            price_str = f"{price:.5f}" if price else "N/A"
+
             for cid in list(known_users):
-                if not _get_settings(cid).get("scanner", False): continue
-                if not _get_settings(cid).get("auto", False): continue
-                key = f"{cid}:{asset_code}"
-                if now - scanner_cooldowns.get(key, 0) < DEFAULT_COOLDOWN: continue
-                scanner_cooldowns[key] = now
-                price = None
-                try:
-                    c = candles[-1]
-                    price = float(c["close"] if isinstance(c, dict) else c.close)
-                except Exception: pass
-                await _send_signal_message(cid, result, asset_label, "1 minute",
-                                            f"{price:.5f}" if price else "N/A")
-    except asyncio.CancelledError: pass
-    except Exception as exc: log_error(f"Scanner error ({asset_code}): {exc}")
+                ps = _get_settings(cid)
+                if not ps.get("scanner", False): continue
+                if not ps.get("auto", False): continue
+
+                # Per-asset cooldown (prevents same asset firing twice quickly)
+                asset_key = f"{cid}:{asset_code}"
+                if now - scanner_cooldowns.get(asset_key, 0) < DEFAULT_COOLDOWN:
+                    continue
+
+                # Global per-user signal gap (prevents signal flood from multiple assets)
+                if now - user_last_signal.get(cid, 0) < SIGNAL_GAP_SECONDS:
+                    logger.debug(f"Scanner: gap not met for {cid} ({asset_code}), skipping")
+                    continue
+
+                # Update timestamps before sending
+                scanner_cooldowns[asset_key] = now
+                user_last_signal[cid] = now
+
+                logger.info(f"Scanner signal: {asset_code} {result['direction']} → user {cid}")
+                await _send_signal_message(cid, result, asset_label, "1 minute", price_str)
+
+            backoff = 5   # reset backoff on success
+            await asyncio.sleep(CANDLE_PERIOD)
+
+        except asyncio.CancelledError:
+            logger.info(f"Scanner cancelled for {asset_code}")
+            return
+        except Exception as exc:
+            log_error(f"Scanner error ({asset_code}): {exc} — retrying in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 120)   # exponential backoff, max 2 min
 
 
 # ---------------------------------------------------------------------------
@@ -1362,14 +1423,26 @@ async def scanner_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(parts) > 1: args = parts[1:]
     if not args:
         on = _get_settings(chat_id).get("scanner", False)
-        await update.message.reply_text(f"Scanner: {'ON' if on else 'OFF'}\nUse /scanner on or /scanner off")
+        await update.message.reply_text(
+            f"\U0001f4e1 Scanner: {'ON \u2705' if on else 'OFF \U0001f515'}\n"
+            f"Monitoring {len(SCAN_ASSETS)} assets:\n"
+            + "\n".join(f"  \u2022 {a}" for a in SCAN_ASSETS) +
+            f"\n\nSignal gap: {SIGNAL_GAP_SECONDS}s between signals\n"
+            "Use /scanner on or /scanner off\n"
+            "Use /set_gap <seconds> to change the gap"
+        )
         return
     if args[0].lower() == "on":
         _get_settings(chat_id)["scanner"] = True
-        await update.message.reply_text(f"Scanner enabled. Monitoring {len(SCAN_ASSETS)} assets.")
+        await update.message.reply_text(
+            f"\U0001f4e1 Scanner enabled \u2705\n"
+            f"Monitoring {len(SCAN_ASSETS)} assets every {CANDLE_PERIOD}s.\n"
+            f"Signal gap: {SIGNAL_GAP_SECONDS}s\n\n"
+            "Make sure /autoon is also enabled to receive signals."
+        )
     else:
         _get_settings(chat_id)["scanner"] = False
-        await update.message.reply_text("Scanner disabled.")
+        await update.message.reply_text("\U0001f4e1 Scanner disabled \U0001f515")
 
 async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1738,6 +1811,31 @@ async def nav_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def set_gap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set minimum gap between signals. Usage: /set_gap <seconds>"""
+    global SIGNAL_GAP_SECONDS
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1: args = parts[1:]
+    if not args:
+        await update.message.reply_text(
+            f"Current signal gap: {SIGNAL_GAP_SECONDS}s\n"
+            "This is the minimum time between any two signals per user.\n"
+            "Usage: /set_gap <seconds>  (e.g. /set_gap 180)"
+        )
+        return
+    try:
+        secs = int(args[0])
+        if secs < 30 or secs > 3600:
+            await update.message.reply_text("Gap must be between 30 and 3600 seconds.")
+            return
+        SIGNAL_GAP_SECONDS = secs
+        await update.message.reply_text(f"\u2705 Signal gap set to {secs}s.")
+    except ValueError:
+        await update.message.reply_text("Invalid value. Usage: /set_gap 120")
+
+
 async def advanced_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle advanced analysis mode. Usage: /advanced on | /advanced off"""
     chat_id = update.effective_chat.id
@@ -1856,6 +1954,7 @@ telegram_app.add_handler(CommandHandler("set_timeframes",  set_timeframes_comman
 telegram_app.add_handler(CommandHandler("autoon",       autoon_command))
 telegram_app.add_handler(CommandHandler("autooff",      autooff_command))
 telegram_app.add_handler(CommandHandler("scanner",      scanner_command))
+telegram_app.add_handler(CommandHandler("set_gap",      set_gap_command))
 telegram_app.add_handler(CommandHandler("analyze",      analyze_command))
 telegram_app.add_handler(CommandHandler("account",      account_command))
 telegram_app.add_handler(CommandHandler("setssid",      setssid_command))
