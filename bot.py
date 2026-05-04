@@ -205,6 +205,109 @@ _follow_tasks: dict[str, asyncio.Task] = {}
 #                  message_id, task, tp_pips, sl_pips, status, ts
 active_trades: dict[int, dict[str, dict]] = {}
 
+# ---------------------------------------------------------------------------
+# TradingSession — session-based martingale trading tracker
+# ---------------------------------------------------------------------------
+
+class TradingSession:
+    """
+    Tracks a single trading session with martingale step management.
+
+    Attributes
+    ----------
+    chat_id         : Telegram chat ID of the user
+    asset_label     : Display name (e.g. "EUR/USD (OTC)")
+    asset_code      : API code (e.g. "EURUSD_otc")
+    base_stake      : Starting stake amount
+    step_multiplier : Multiplier per loss step (default 2.2)
+    target_profit   : Session ends when net_profit >= this (default 73% of base)
+    """
+
+    PAYOUT_RATIO = 0.85   # 85% payout on win
+
+    def __init__(self, chat_id: int, asset_label: str, asset_code: str,
+                 base_stake: float, step_multiplier: float = 2.2,
+                 target_pct: float = 0.73) -> None:
+        self.chat_id         = chat_id
+        self.asset_label     = asset_label
+        self.asset_code      = asset_code
+        self.base_stake      = base_stake
+        self.step_multiplier = step_multiplier
+        self.target_profit   = round(base_stake * target_pct, 2)
+        self.net_profit      = 0.0
+        self.current_step    = 0       # 0 = first trade at base_stake
+        self.active          = True
+        self.trade_count     = 0
+
+        # Current trade state
+        self.trade_direction: str | None = None
+        self.entry_price:     float      = 0.0
+        self.expiry_seconds:  int        = 60
+        self.start_time:      float      = 0.0
+        self.live_message_id: int | None = None
+        self.update_task:     "asyncio.Task | None" = None
+
+    # ── Stake management ─────────────────────────────────────────────── #
+
+    def next_stake(self) -> float:
+        """Return the stake for the current step."""
+        return round(self.base_stake * (self.step_multiplier ** self.current_step), 2)
+
+    def is_target_reached(self) -> bool:
+        return self.net_profit >= self.target_profit
+
+    # ── Trade recording ──────────────────────────────────────────────── #
+
+    def record_win(self, profit: float | None = None) -> float:
+        """Record a win. Returns profit amount."""
+        stake  = self.next_stake()
+        profit = profit if profit is not None else round(stake * self.PAYOUT_RATIO, 2)
+        self.net_profit   = round(self.net_profit + profit, 2)
+        self.current_step = 0   # reset to base stake after win
+        self.trade_count += 1
+        return profit
+
+    def record_loss(self, loss: float | None = None) -> float:
+        """Record a loss. Returns loss amount (negative)."""
+        stake = self.next_stake()
+        loss  = loss if loss is not None else -stake
+        self.net_profit   = round(self.net_profit + loss, 2)
+        self.current_step += 1   # advance martingale step
+        self.trade_count  += 1
+        return loss
+
+    # ── Live tracking ────────────────────────────────────────────────── #
+
+    def start_trade(self, direction: str, entry_price: float,
+                    expiry_seconds: int = 60) -> None:
+        self.trade_direction = direction
+        self.entry_price     = entry_price
+        self.expiry_seconds  = expiry_seconds
+        self.start_time      = time.time()
+
+    def stop_live_tracking(self) -> None:
+        if self.update_task and not self.update_task.done():
+            self.update_task.cancel()
+        self.update_task = None
+
+    def summary(self) -> str:
+        stake = self.next_stake()
+        bar   = "█" * min(10, int(self.net_profit / max(self.target_profit, 0.01) * 10))
+        bar  += "░" * (10 - len(bar))
+        return (
+            f"🚀 Session: {self.asset_label}\n"
+            f"Base stake: ${self.base_stake:.2f}  "
+            f"Target: +${self.target_profit:.2f} (73%)\n"
+            f"Net P&L: {'+' if self.net_profit >= 0 else ''}{self.net_profit:.2f}$  "
+            f"Step: {self.current_step + 1}\n"
+            f"Progress: {bar}\n"
+            f"Next stake: ${stake:.2f}  Trades: {self.trade_count}"
+        )
+
+
+# Global registry: {chat_id: TradingSession}
+trading_sessions: dict[int, TradingSession] = {}
+
 PREEMPTIVE_REFRESH_HOURS = 23   # reconnect before the 24-h session boundary
 PING_INTERVAL_SECONDS    = 20   # keep-alive ping cadence
 SIGNAL_EXPIRY_SEC        = 600  # 10 minutes
@@ -519,10 +622,13 @@ def _get_user_persistent(chat_id: int) -> dict:
     ps.setdefault("timeframe",     "1 minute")
     ps.setdefault("auto_strategy", True)
     ps.setdefault("scanner",       False)
-    ps.setdefault("cooldown",      DEFAULT_COOLDOWN_SECONDS)
-    ps.setdefault("auto_validate", True)          # auto signal validation
-    ps.setdefault("paper_balance", PAPER_START_BALANCE)
-    ps.setdefault("paper_stake",   PAPER_STAKE)
+    ps.setdefault("cooldown",         DEFAULT_COOLDOWN_SECONDS)
+    ps.setdefault("auto_validate",    True)
+    ps.setdefault("paper_balance",    PAPER_START_BALANCE)
+    ps.setdefault("paper_stake",      PAPER_STAKE)
+    ps.setdefault("energy",           1000)    # gamification energy
+    ps.setdefault("is_demo",          True)    # demo/real mode
+    ps.setdefault("virtual_balance",  0.0)     # session cumulative P&L
     return ps
 
 
@@ -2630,6 +2736,8 @@ def _main_menu_keyboard(user_id: int, us: "UserSession | None" = None) -> Inline
     return InlineKeyboardMarkup([
         # ── Signals ──────────────────────────────────────────────────────
         [InlineKeyboardButton("\U0001f4ca Get Signal",       callback_data="menu:signal")],
+        [InlineKeyboardButton("\U0001f3ae New Session",      callback_data="sess:new"),
+         InlineKeyboardButton("\U0001f4ca ADX",              callback_data="menu:adx")],
         [InlineKeyboardButton(auto_label,                    callback_data="menu:toggle_auto"),
          InlineKeyboardButton(scanner_label,                 callback_data="menu:toggle_scanner")],
         # ── Strategy & analysis ───────────────────────────────────────────
@@ -2647,6 +2755,9 @@ def _main_menu_keyboard(user_id: int, us: "UserSession | None" = None) -> Inline
          InlineKeyboardButton("\u2139\ufe0f How it works",   callback_data="menu:howto")],
         [InlineKeyboardButton("\U0001f511 Refresh SSID",     callback_data="menu:ssid"),
          InlineKeyboardButton("\U0001f4b0 Account",          callback_data="menu:account")],
+        [InlineKeyboardButton("\U0001f3ae Mode: Demo" if ps.get("is_demo", True) else "\U0001f4b5 Mode: Real",
+                              callback_data="menu:toggle_mode"),
+         InlineKeyboardButton("\u26a1 Energy",               callback_data="menu:energy")],
     ])
 
 
@@ -3131,6 +3242,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     [InlineKeyboardButton("🔙 Back", callback_data="menu:back")]
                 ]),
             )
+        return ConversationHandler.END
+
+    if data == "menu:toggle_mode":
+        ps = _get_user_settings(user_id)
+        ps["is_demo"] = not ps.get("is_demo", True)
+        _save_user_persistent_settings()
+        if us and us.session_manager:
+            us.session_manager.is_demo = ps["is_demo"]
+        mode_str = "Demo 🎮" if ps["is_demo"] else "Real 💵"
+        await query.edit_message_text(
+            f"Switched to {mode_str} mode.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="menu:back")]
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:energy":
+        ps     = _get_user_settings(user_id)
+        energy = ps.get("energy", 1000)
+        bar    = "⚡" * (energy // 100) + "░" * (10 - energy // 100)
+        await query.edit_message_text(
+            f"⚡ Energy: {energy}/1000\n{bar}\n\nDecreases by 10 per trade.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔋 Recharge", callback_data="menu:energy_recharge")],
+                [InlineKeyboardButton("🔙 Back",     callback_data="menu:back")],
+            ]),
+        )
+        return ConversationHandler.END
+
+    if data == "menu:energy_recharge":
+        ps = _get_user_settings(user_id)
+        ps["energy"] = 1000
+        _save_user_persistent_settings()
+        await query.edit_message_text(
+            "⚡ Energy recharged to 1000!",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔙 Back", callback_data="menu:back")]
+            ]),
+        )
         return ConversationHandler.END
 
     # ── Settings sub-menu ────────────────────────────────────────────────
@@ -5082,29 +5233,475 @@ async def manual_trades_command(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("\n".join(lines))
 
 
+    lines.append(f"\nTotal: {len(rows)} trades. Use /export for full CSV.")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# TradingSession commands & live tracking
+# ---------------------------------------------------------------------------
+
+def _session_stake_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("$1",    callback_data="sess:stake:1"),
+         InlineKeyboardButton("$1.5",  callback_data="sess:stake:1.5"),
+         InlineKeyboardButton("$2",    callback_data="sess:stake:2")],
+        [InlineKeyboardButton("$2.5",  callback_data="sess:stake:2.5"),
+         InlineKeyboardButton("$5",    callback_data="sess:stake:5"),
+         InlineKeyboardButton("$10",   callback_data="sess:stake:10")],
+        [InlineKeyboardButton("✏️ Custom", callback_data="sess:stake:custom")],
+        [InlineKeyboardButton("🔙 Back",   callback_data="menu:back")],
+    ])
+
+
+def _session_expiry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("60s",  callback_data="sess:expiry:60"),
+         InlineKeyboardButton("120s", callback_data="sess:expiry:120"),
+         InlineKeyboardButton("300s", callback_data="sess:expiry:300")],
+        [InlineKeyboardButton("✏️ Custom", callback_data="sess:expiry:custom")],
+    ])
+
+
+def _session_asset_keyboard() -> InlineKeyboardMarkup:
+    """Keyboard showing all available OTC assets for session selection."""
+    rows = []
+    items = list(ASSETS.keys())
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(items[i], callback_data=f"sess:asset:{items[i]}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(items[i+1], callback_data=f"sess:asset:{items[i+1]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu:back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _live_trade_loop(
+    session: TradingSession,
+    chat_id: int,
+    message_id: int,
+    us: "UserSession",
+) -> None:
+    """Background task: edit trade message every 5s with live P&L, then auto-evaluate."""
+    try:
+        expiry   = session.expiry_seconds
+        elapsed  = 0
+        interval = 5
+
+        while elapsed < expiry:
+            await asyncio.sleep(interval)
+            elapsed += interval
+
+            current = await _get_current_price(us, session.asset_code)
+            if current is None:
+                continue
+
+            diff      = current - session.entry_price
+            direction = session.trade_direction or "CALL"
+            pct       = diff / session.entry_price * 100 if session.entry_price else 0
+            remaining = max(0, expiry - elapsed)
+
+            if direction == "CALL":
+                winning = diff > 0
+                pnl_str = f"{diff:+.5f} ({pct:+.3f}%)"
+            else:
+                winning = diff < 0
+                pnl_str = f"{-diff:+.5f} ({-pct:+.3f}%)"
+
+            icon = "✅" if winning else "❌"
+            arrow = "📈" if diff >= 0 else "📉"
+
+            text = (
+                f"📊 Live Trade | {session.asset_label}\n"
+                f"Entry: {session.entry_price:.5f} ({direction})\n"
+                f"Remaining: {remaining}s\n"
+                f"Current: {current:.5f}\n"
+                f"P&L: {pnl_str}  {icon}\n"
+                f"{arrow} Stake: ${session.next_stake():.2f}"
+            )
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=message_id, text=text
+                )
+            except Exception:
+                pass
+
+        # ── Auto-evaluate at expiry ───────────────────────────────────────
+        final_price = await _get_current_price(us, session.asset_code) or session.entry_price
+        diff        = final_price - session.entry_price
+        direction   = session.trade_direction or "CALL"
+        won         = (diff > MIN_PRICE_MOVE) if direction == "CALL" else (diff < -MIN_PRICE_MOVE)
+
+        if won:
+            profit = session.record_win()
+            result_icon = "✅ WIN"
+        else:
+            profit = session.record_loss()
+            result_icon = "❌ LOSS"
+
+        # Deduct energy
+        ps = _get_user_settings(chat_id)
+        ps["energy"] = max(0, ps.get("energy", 1000) - 10)
+        _save_user_persistent_settings()
+
+        final_text = (
+            f"🏁 Trade Result | {session.asset_label}\n\n"
+            f"{result_icon}  {direction}\n"
+            f"Entry:  {session.entry_price:.5f}\n"
+            f"Exit:   {final_price:.5f}  ({diff:+.5f})\n"
+            f"Profit: {'+' if profit >= 0 else ''}{profit:.2f}$\n\n"
+            f"{session.summary()}"
+        )
+
+        if session.is_target_reached():
+            final_text += f"\n\n🎉 TARGET REACHED! Session complete."
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🚀 New Session", callback_data="sess:new"),
+                 InlineKeyboardButton("📋 Manual Mode", callback_data="menu:back")],
+            ])
+            session.active = False
+            trading_sessions.pop(chat_id, None)
+        else:
+            stake = session.next_stake()
+            final_text += f"\n\n👉 Next stake: ${stake:.2f} (Step {session.current_step + 1})"
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📈 CALL", callback_data=f"sess:trade:CALL"),
+                 InlineKeyboardButton("📉 PUT",  callback_data=f"sess:trade:PUT")],
+                [InlineKeyboardButton("⏹ End Session", callback_data="sess:end")],
+            ])
+
+        try:
+            await telegram_app.bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=final_text, reply_markup=keyboard,
+            )
+        except Exception:
+            await telegram_app.bot.send_message(
+                chat_id=chat_id, text=final_text, reply_markup=keyboard
+            )
+
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:
+        log_error(f"_live_trade_loop error: {exc}")
+    finally:
+        session.update_task = None
+
+
+async def _start_live_trade(chat_id: int, direction: str,
+                             expiry: int, us: "UserSession") -> None:
+    """Start a live trade for the user's active session."""
+    session = trading_sessions.get(chat_id)
+    if not session:
+        await telegram_app.bot.send_message(
+            chat_id=chat_id,
+            text="No active session. Use 🎮 New Session from the menu."
+        )
+        return
+
+    # Get entry price
+    entry = await _get_current_price(us, session.asset_code) or 0.0
+    session.start_trade(direction, entry, expiry)
+
+    stake = session.next_stake()
+    sent  = await telegram_app.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"📊 Live Trade | {session.asset_label}\n"
+            f"Entry: {entry:.5f} ({direction})\n"
+            f"Remaining: {expiry}s\n"
+            f"Stake: ${stake:.2f}\n"
+            "Tracking..."
+        ),
+    )
+    session.live_message_id = sent.message_id
+    session.stop_live_tracking()
+    session.update_task = asyncio.create_task(
+        _live_trade_loop(session, chat_id, sent.message_id, us),
+        name=f"live_{chat_id}",
+    )
+
+
+@_require_auth
+async def session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Start a new trading session — shows asset picker."""
+    chat_id = update.effective_chat.id
+    # Cancel any existing session
+    old = trading_sessions.pop(chat_id, None)
+    if old:
+        old.stop_live_tracking()
+    await update.message.reply_text(
+        "🎮 New Trading Session\n\nSelect an asset:",
+        reply_markup=_session_asset_keyboard(),
+    )
+
+
+@_require_auth
+async def trade_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger a trade in the active session. Usage: /trade CALL [expiry]"""
+    chat_id = update.effective_chat.id
+    us      = _get_user_session(chat_id)
+    session = trading_sessions.get(chat_id)
+
+    if not session:
+        await update.message.reply_text(
+            "No active session. Start one with /session or 🎮 New Session."
+        )
+        return
+
+    args = context.args or []
+    direction = (args[0].upper() if args else "CALL")
+    if direction not in ("CALL", "PUT"):
+        direction = "CALL"
+    expiry = int(args[1]) if len(args) > 1 and args[1].isdigit() else 60
+
+    await _start_live_trade(chat_id, direction, expiry, us)
+
+
+@_require_auth
+async def end_session_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """End the current trading session."""
+    chat_id = update.effective_chat.id
+    session = trading_sessions.pop(chat_id, None)
+    if not session:
+        await update.message.reply_text("No active session.")
+        return
+    session.stop_live_tracking()
+    await update.message.reply_text(
+        f"⏹ Session ended.\n\n{session.summary()}"
+    )
+
+
+@_require_auth
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch between demo and real mode. Usage: /mode demo | /mode real"""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+    us      = _get_user_session(chat_id)
+
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1:
+            args = parts[1:]
+
+    if not args:
+        current = "Demo 🎮" if ps.get("is_demo", True) else "Real 💵"
+        await update.message.reply_text(
+            f"Current mode: {current}\n\n"
+            "Switch with:\n  /mode demo\n  /mode real"
+        )
+        return
+
+    arg = args[0].lower()
+    if arg == "demo":
+        ps["is_demo"] = True
+        _save_user_persistent_settings()
+        if us and us.session_manager:
+            us.session_manager.is_demo = True
+        await update.message.reply_text(
+            "🎮 Switched to DEMO mode.\n"
+            "Signals and paper trading use demo balance."
+        )
+    elif arg == "real":
+        ps["is_demo"] = False
+        _save_user_persistent_settings()
+        if us and us.session_manager:
+            us.session_manager.is_demo = False
+        await update.message.reply_text(
+            "💵 Switched to REAL mode.\n"
+            "⚠️ Signals now reference real account data."
+        )
+    else:
+        await update.message.reply_text("Usage: /mode demo  or  /mode real")
+
+
+@_require_auth
+async def stake_table_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show recommended balance for each stake size."""
+    lines = [
+        "📊 Stake Recommendation Table\n",
+        "STAKE    MIN BALANCE",
+        "─────────────────────",
+    ]
+    for stake in [1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 20.0, 50.0, 100.0]:
+        rec = stake * 20
+        lines.append(f"${stake:<8.2f} ${rec:.2f}")
+    lines.append("\nFormula: min_balance = stake × 20")
+    await update.message.reply_text("\n".join(lines))
+
+
+@_require_auth
+async def energy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current energy level."""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+    energy  = ps.get("energy", 1000)
+    bar     = "⚡" * (energy // 100) + "░" * (10 - energy // 100)
+    await update.message.reply_text(
+        f"⚡ Energy: {energy}/1000\n{bar}\n\n"
+        "Energy decreases by 10 per trade.\n"
+        "Use /energy_recharge to restore (once per day)."
+    )
+
+
+@_require_auth
+async def energy_recharge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Recharge energy to 1000."""
+    chat_id = update.effective_chat.id
+    ps      = _get_user_settings(chat_id)
+    ps["energy"] = 1000
+    _save_user_persistent_settings()
+    await update.message.reply_text("⚡ Energy recharged to 1000!")
+
+
+async def session_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle all sess:* callback buttons."""
+    query   = update.callback_query
+    await query.answer()
+    data    = query.data
+    chat_id = query.message.chat.id
+    us      = _get_user_session(chat_id)
+
+    if not us:
+        await query.edit_message_text("⛔ Not authorised.")
+        return
+
+    # ── Asset selection ───────────────────────────────────────────────────
+    if data.startswith("sess:asset:"):
+        asset_label = data[len("sess:asset:"):]
+        context.user_data["sess_asset"] = asset_label
+        await query.edit_message_text(
+            f"Asset: {asset_label}\n\nSelect stake amount:",
+            reply_markup=_session_stake_keyboard(),
+        )
+        return
+
+    # ── Stake selection ───────────────────────────────────────────────────
+    if data.startswith("sess:stake:"):
+        val = data[len("sess:stake:"):]
+        if val == "custom":
+            await query.edit_message_text(
+                "Send your custom stake amount (e.g. 3.5):"
+            )
+            context.user_data["awaiting_custom_stake"] = True
+            return
+
+        try:
+            stake = float(val)
+        except ValueError:
+            stake = 1.0
+
+        asset_label = context.user_data.get("sess_asset", "EUR/USD (OTC)")
+        asset_code  = ASSETS.get(asset_label, "EURUSD_otc")
+
+        # Create session
+        session = TradingSession(
+            chat_id=chat_id,
+            asset_label=asset_label,
+            asset_code=asset_code,
+            base_stake=stake,
+        )
+        trading_sessions[chat_id] = session
+
+        await query.edit_message_text(
+            f"🚀 Trading session initialized!\n\n"
+            f"Asset: {asset_label}\n"
+            f"Base stake: ${stake:.2f}\n"
+            f"Target profit: +${session.target_profit:.2f} (73%)\n"
+            f"Step: 1\n\n"
+            "👉 When ready, tap CALL or PUT to start a trade:",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📈 CALL", callback_data="sess:trade:CALL"),
+                 InlineKeyboardButton("📉 PUT",  callback_data="sess:trade:PUT")],
+                [InlineKeyboardButton("⏹ End Session", callback_data="sess:end")],
+            ]),
+        )
+        return
+
+    # ── Trade direction ───────────────────────────────────────────────────
+    if data.startswith("sess:trade:"):
+        direction = data[len("sess:trade:"):]
+        session   = trading_sessions.get(chat_id)
+        if not session:
+            await query.edit_message_text("No active session. Start one with /session.")
+            return
+        # Ask for expiry
+        context.user_data["sess_direction"] = direction
+        await query.edit_message_text(
+            f"Direction: {direction}\nSelect expiry time:",
+            reply_markup=_session_expiry_keyboard(),
+        )
+        return
+
+    # ── Expiry selection → start live trade ──────────────────────────────
+    if data.startswith("sess:expiry:"):
+        val = data[len("sess:expiry:"):]
+        if val == "custom":
+            await query.edit_message_text("Send expiry in seconds (e.g. 90):")
+            context.user_data["awaiting_custom_expiry"] = True
+            return
+        expiry    = int(val)
+        direction = context.user_data.get("sess_direction", "CALL")
+        await query.edit_message_text(f"⏳ Starting {direction} trade ({expiry}s)...")
+        await _start_live_trade(chat_id, direction, expiry, us)
+        return
+
+    # ── New session ───────────────────────────────────────────────────────
+    if data == "sess:new":
+        old = trading_sessions.pop(chat_id, None)
+        if old:
+            old.stop_live_tracking()
+        await query.edit_message_text(
+            "🎮 New Trading Session\n\nSelect an asset:",
+            reply_markup=_session_asset_keyboard(),
+        )
+        return
+
+    # ── End session ───────────────────────────────────────────────────────
+    if data == "sess:end":
+        session = trading_sessions.pop(chat_id, None)
+        if session:
+            session.stop_live_tracking()
+            await query.edit_message_text(
+                f"⏹ Session ended.\n\n{session.summary()}"
+            )
+        else:
+            await query.edit_message_text("No active session.")
+        return
+
+
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler("start", start),
-        CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:)"),
+        CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:|trade:|sess:)"),
     ],
     states={
-        CHOOSE_ASSET: [CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:)")],
-        CHOOSE_TIME:  [CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:)")],
+        CHOOSE_ASSET: [CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:|trade:|sess:)")],
+        CHOOSE_TIME:  [CallbackQueryHandler(button_handler, pattern="^(?!vote:|follow:|trade:|sess:)")],
     },
     fallbacks=[CommandHandler("start", start)],
     per_message=False,
 )
 
 # Vote and follow handlers registered BEFORE conv_handler so they take priority
-telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler,     pattern="^vote:noop$"))
-telegram_app.add_handler(CallbackQueryHandler(vote_handler,          pattern="^vote:(win|loss):"))
-telegram_app.add_handler(CallbackQueryHandler(follow_handler,        pattern="^follow:"))
-telegram_app.add_handler(CallbackQueryHandler(trade_callback_handler, pattern="^trade:"))
+telegram_app.add_handler(CallbackQueryHandler(vote_noop_handler,       pattern="^vote:noop$"))
+telegram_app.add_handler(CallbackQueryHandler(vote_handler,            pattern="^vote:(win|loss):"))
+telegram_app.add_handler(CallbackQueryHandler(follow_handler,          pattern="^follow:"))
+telegram_app.add_handler(CallbackQueryHandler(trade_callback_handler,  pattern="^trade:"))
+telegram_app.add_handler(CallbackQueryHandler(session_callback_handler, pattern="^sess:"))
 telegram_app.add_handler(conv_handler)
 telegram_app.add_handler(CommandHandler("signal",             signal_command))
 telegram_app.add_handler(CommandHandler("stats",              stats_command))
 telegram_app.add_handler(CommandHandler("analyze",            analyze_command))
 telegram_app.add_handler(CommandHandler("export",             export_command))
+telegram_app.add_handler(CommandHandler("session",            session_command))
+telegram_app.add_handler(CommandHandler("trade",              trade_session_command))
+telegram_app.add_handler(CommandHandler("end_session",        end_session_command))
+telegram_app.add_handler(CommandHandler("mode",               mode_command))
+telegram_app.add_handler(CommandHandler("stake_table",        stake_table_command))
+telegram_app.add_handler(CommandHandler("energy",             energy_command))
+telegram_app.add_handler(CommandHandler("energy_recharge",    energy_recharge_command))
 telegram_app.add_handler(CommandHandler("paper",              paper_command))
 telegram_app.add_handler(CommandHandler("paper_reset",        paper_reset_command))
 telegram_app.add_handler(CommandHandler("export_paper",       export_paper_command))
