@@ -602,9 +602,327 @@ def _build_analysis(chat_id):
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
+# Trading Smart Bot UI helpers
+# ---------------------------------------------------------------------------
+
+TIMEFRAMES_UI = {
+    "5 seconds":  5,
+    "1 minute":   60,
+    "2 minutes":  120,
+    "3 minutes":  180,
+    "5 minutes":  300,
+}
+
+# Assets shown in the UI picker (paginated, 8 per page)
+ASSETS_UI_PAGES = [
+    [
+        ("USD/CAD (OTC)", "USDCAD_otc"),
+        ("GBP/JPY (OTC)", "GBPJPY_otc"),
+        ("CAD/JPY (OTC)", "CADJPY_otc"),
+        ("AUD/USD (OTC)", "AUDUSD_otc"),
+        ("EUR/USD (OTC)", "EURUSD_otc"),
+        ("USD/JPY (OTC)", "USDJPY_otc"),
+        ("GBP/AUD (OTC)", "GBPAUD_otc"),
+        ("EUR/CAD (OTC)", "EURCAD_otc"),
+    ],
+    [
+        ("GBP/USD (OTC)", "GBPUSD_otc"),
+        ("EUR/JPY (OTC)", "EURJPY_otc"),
+        ("USD/TRY (OTC)", "USDTRY_otc"),
+        ("USD/MXN (OTC)", "USDMXN_otc"),
+        ("USD/INR (OTC)", "USDINR_otc"),
+        ("EUR/TRY (OTC)", "EURTRY_otc"),
+        ("USD/ZAR (OTC)", "USDZARUSD_otc"),
+        ("GBP/ZAR (OTC)", "GBPZAR_otc"),
+    ],
+]
+
+
+def _ascii_chart(candles) -> str:
+    """Generate a simple ASCII price chart from recent candles."""
+    if not candles or len(candles) < 3:
+        return "▬▬▬▬▬"
+    closes = _closes(candles[-8:])
+    mn, mx = min(closes), max(closes)
+    rng = mx - mn or 1e-10
+    bars = ""
+    for p in closes:
+        lvl = int((p - mn) / rng * 4)
+        bars += ["▁", "▃", "▅", "▇", "█"][min(lvl, 4)]
+    # Add timestamps for last 3 points
+    now = datetime.utcnow()
+    t1  = now.strftime("%H:%M")
+    return f"{bars}  {t1}"
+
+
+def _atr_info(candles) -> tuple[str, str]:
+    """Return (market_setting, volatility) based on ATR."""
+    if not candles or len(candles) < 10:
+        return "Stable", "Medium"
+    sample = candles[-1]
+    if isinstance(sample, dict):
+        highs = [float(c["high"]) for c in candles[-10:]]
+        lows  = [float(c["low"])  for c in candles[-10:]]
+    else:
+        closes = _closes(candles[-10:])
+        highs = closes; lows = closes
+    atr = sum(h - l for h, l in zip(highs, lows)) / len(highs)
+    price = float(candles[-1]["close"] if isinstance(candles[-1], dict) else candles[-1].close)
+    atr_pct = (atr / price * 100) if price else 0
+    if atr_pct < 0.03:
+        return "Stable", "Low"
+    elif atr_pct < 0.08:
+        return "Stable", "Medium"
+    elif atr_pct < 0.15:
+        return "Active", "High"
+    else:
+        return "Volatile", "High"
+
+
+def _best_asset_recommendation(chat_id: int) -> str:
+    """Return the asset with the highest win rate from the user's CSV."""
+    rows = _read_trades(chat_id)
+    if len(rows) < 5:
+        return "EUR/USD (OTC)"
+    groups: dict[str, list] = {}
+    for r in rows:
+        a = r.get("asset", "")
+        if a:
+            groups.setdefault(a, []).append(r)
+    best, best_wr = "EUR/USD (OTC)", 0.0
+    for asset, g in groups.items():
+        if len(g) >= 3:
+            wr = sum(1 for r in g if r.get("result") == "win") / len(g)
+            if wr > best_wr:
+                best_wr, best = wr, asset
+    return best
+
+
+def _trade_stats(chat_id: int) -> tuple[int, int, int, int]:
+    """Return (total, wins, losses, streak) from CSV."""
+    rows = _read_trades(chat_id)
+    total  = len(rows)
+    wins   = sum(1 for r in rows if r.get("result") == "win")
+    losses = total - wins
+    streak = 0
+    for r in reversed(rows):
+        if r.get("result") == "win":
+            streak += 1
+        else:
+            break
+    return total, wins, losses, streak
+
+
+# ---------------------------------------------------------------------------
+# New UI screens
+# ---------------------------------------------------------------------------
+
+async def _show_main_menu(chat_id: int, update_or_query, context) -> None:
+    """Show the Trading Smart Bot main screen."""
+    known_users.add(chat_id)
+    ps = _get_settings(chat_id)
+
+    # Account balance
+    balance_str = "—"
+    if session_manager and session_manager.is_connected and session_manager.client:
+        try:
+            bal = await session_manager.client.balance()
+            balance_str = f"${bal:,.2f}"
+        except Exception:
+            pass
+
+    total, wins, losses, streak = _trade_stats(chat_id)
+    po_ok = session_manager is not None and session_manager.is_connected
+    conn  = "\U0001f7e2 Live" if po_ok else "\U0001f534 Offline"
+    auto_icon = "\U0001f514" if ps.get("auto") else "\U0001f515"
+
+    text = (
+        f"\U0001f916 Trading Smart Bot\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\U0001f4b0 Balance: {balance_str}  {conn}\n"
+        f"\U0001f4ca Trades: {total}  \u2705 {wins}  \u274c {losses}  \U0001f525 Streak: {streak}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"Real-time signals using RSI + MACD + Bollinger Bands\n"
+        f"Auto-signals: {auto_icon}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f4ca Get signal", callback_data="nav:assets:0")],
+        [InlineKeyboardButton("\u2139\ufe0f How the bot works", callback_data="nav:howto"),
+         InlineKeyboardButton("\U0001f4ac Ask a question",     callback_data="nav:ask")],
+        [InlineKeyboardButton(f"{auto_icon} Auto-signals",     callback_data="nav:toggle_auto"),
+         InlineKeyboardButton("\U0001f4e1 Scanner",            callback_data="nav:toggle_scanner")],
+        [InlineKeyboardButton("\U0001f4cb Analyze",            callback_data="nav:analyze"),
+         InlineKeyboardButton("\U0001f511 Refresh SSID",       callback_data="nav:refresh_ssid")],
+    ])
+
+    if hasattr(update_or_query, "message") and update_or_query.message:
+        await update_or_query.message.reply_text(text, reply_markup=keyboard)
+    elif hasattr(update_or_query, "edit_message_text"):
+        try:
+            await update_or_query.edit_message_text(text, reply_markup=keyboard)
+        except Exception:
+            await telegram_app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+    else:
+        await telegram_app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+
+
+def _assets_keyboard(page: int) -> InlineKeyboardMarkup:
+    """Build the asset selection keyboard for a given page."""
+    page = max(0, min(page, len(ASSETS_UI_PAGES) - 1))
+    items = ASSETS_UI_PAGES[page]
+    rows  = []
+    for i in range(0, len(items), 2):
+        row = [InlineKeyboardButton(items[i][0], callback_data=f"nav:tf:{items[i][1]}")]
+        if i + 1 < len(items):
+            row.append(InlineKeyboardButton(items[i+1][0], callback_data=f"nav:tf:{items[i+1][1]}"))
+        rows.append(row)
+    # Pagination
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("\u2190 Back", callback_data=f"nav:assets:{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1} of {len(ASSETS_UI_PAGES)}", callback_data="nav:noop"))
+    if page < len(ASSETS_UI_PAGES) - 1:
+        nav.append(InlineKeyboardButton("Next \u2192", callback_data=f"nav:assets:{page+1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("\U0001f519 Back", callback_data="nav:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _timeframe_keyboard(asset_code: str) -> InlineKeyboardMarkup:
+    rows = []
+    tfs  = list(TIMEFRAMES_UI.keys())
+    for i in range(0, len(tfs), 2):
+        row = [InlineKeyboardButton(tfs[i], callback_data=f"nav:signal:{asset_code}:{TIMEFRAMES_UI[tfs[i]]}")]
+        if i + 1 < len(tfs):
+            row.append(InlineKeyboardButton(tfs[i+1], callback_data=f"nav:signal:{asset_code}:{TIMEFRAMES_UI[tfs[i+1]]}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton("\U0001f519 Back", callback_data="nav:assets:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _show_signal_screen(query, chat_id: int, asset_code: str, tf_seconds: int) -> None:
+    """Fetch real signal and display in Trading Smart Bot format."""
+    asset_label = next((k for k, v in {**ASSETS, **{a[0]: a[1] for p in ASSETS_UI_PAGES for a in p}}
+                        .items() if v == asset_code), asset_code)
+    tf_label    = next((k for k, v in TIMEFRAMES_UI.items() if v == tf_seconds), f"{tf_seconds}s")
+
+    await query.edit_message_text(
+        f"\u23f3 Analysing {asset_label}...",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001f519 Back", callback_data="nav:assets:0")
+        ]])
+    )
+
+    if not (session_manager and session_manager.is_connected):
+        await query.edit_message_text(
+            "\U0001f534 Not connected to Pocket Option.\nUse /setssid to connect.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001f519 Back", callback_data="nav:home")
+            ]])
+        )
+        return
+
+    candles = await session_manager.get_candles(asset_code, max(tf_seconds, 60), CANDLE_COUNT)
+    result  = compute_signal(candles, tf_seconds)
+
+    price = None
+    if candles:
+        try:
+            c = candles[-1]
+            price = float(c["close"] if isinstance(c, dict) else c.close)
+        except Exception:
+            pass
+
+    market_setting, volatility = _atr_info(candles) if candles else ("Stable", "Medium")
+    conf = result.get("confidence", 75)
+    rsi  = result.get("rsi")
+    d    = result["direction"]
+
+    # Confidence bar
+    filled = round(conf / 10)
+    bar    = "\u2588" * filled + "\u2591" * (10 - filled)
+
+    # ASCII chart
+    chart = _ascii_chart(candles) if candles else "▬▬▬▬▬"
+
+    if d == "HIGHER":
+        signal_line = "\U0001f7e2 HIGHER (CALL)"
+    elif d == "LOWER":
+        signal_line = "\U0001f534 LOWER (PUT)"
+    else:
+        signal_line = "\u26aa WAIT — no clear signal"
+
+    price_str = f"{price:.5f}" if price else "N/A"
+    rsi_str   = f"{rsi:.1f}" if rsi else "N/A"
+
+    text = (
+        f"\U0001f4ca Signal: {asset_label} \u2014 {tf_label}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\U0001f4c8 Market: {market_setting}\n"
+        f"\u26a1 Volatility: {volatility}\n"
+        f"\U0001f9e0 RSI: {rsi_str}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\U0001f3af Signal reliability: {conf}%\n"
+        f"{bar}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\U0001f916 Bot signal: {signal_line}\n"
+        f"\U0001f4b2 Price: {price_str}\n"
+        f"\U0001f4c9 Chart: {chart}\n"
+        f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"
+    )
+
+    if d == "WAIT":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("\U0001f504 Try again",  callback_data=f"nav:signal:{asset_code}:{tf_seconds}")],
+            [InlineKeyboardButton("\U0001f519 Back",       callback_data="nav:assets:0")],
+            [InlineKeyboardButton("\U0001f3e0 Main menu",  callback_data="nav:home")],
+        ])
+        await query.edit_message_text(text, reply_markup=keyboard)
+        return
+
+    # Register pending signal for win/loss voting
+    signal_id = _make_signal_id(chat_id)
+    pending_signals[signal_id] = {
+        "user_id": chat_id, "ts": time.time(), "voted": False,
+        "asset_label": asset_label, "tf_label": tf_label,
+        "direction": "CALL" if d == "HIGHER" else "PUT",
+        "confidence": conf, "rsi": rsi, "price": price_str,
+        "market": market_setting, "reason": result.get("reason", ""),
+    }
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f44d Win",  callback_data=f"vote:win:{signal_id}"),
+         InlineKeyboardButton("\U0001f44e Loss", callback_data=f"vote:loss:{signal_id}")],
+        [InlineKeyboardButton("\U0001f504 New signal", callback_data=f"nav:signal:{asset_code}:{tf_seconds}"),
+         InlineKeyboardButton("\U0001f519 Back",       callback_data="nav:assets:0")],
+        [InlineKeyboardButton("\U0001f3e0 Main menu",  callback_data="nav:home")],
+    ])
+
+    # Send as photo if available, else text
+    img = SIGNAL_IMG_BUY if d == "HIGHER" else SIGNAL_IMG_SELL
+    if img:
+        try:
+            await query.edit_message_text(text, reply_markup=keyboard)
+            await telegram_app.bot.send_photo(
+                chat_id=chat_id, photo=img,
+                caption=f"{signal_line}\n{asset_label} | {tf_label} | {conf}% reliability",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("\U0001f44d Win",  callback_data=f"vote:win:{signal_id}"),
+                    InlineKeyboardButton("\U0001f44e Loss", callback_data=f"vote:loss:{signal_id}"),
+                ]])
+            )
+            return
+        except Exception:
+            pass
+    await query.edit_message_text(text, reply_markup=keyboard)
+
+
+# ---------------------------------------------------------------------------
 # Inline menu
 # ---------------------------------------------------------------------------
 def _main_menu(chat_id):
+    """Legacy compact menu — kept for /start fallback."""
     ps = _get_settings(chat_id)
     auto_lbl    = "\U0001f514 Auto-signals: ON"  if ps.get("auto")    else "\U0001f515 Auto-signals: OFF"
     scanner_lbl = "\U0001f4e1 Scanner: ON"        if ps.get("scanner") else "\U0001f4e1 Scanner: OFF"
@@ -624,14 +942,7 @@ def _main_menu(chat_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     known_users.add(chat_id)
-    name = update.effective_user.first_name or "Trader"
-    po_ok = session_manager is not None and session_manager.is_connected
-    conn  = "\U0001f7e2 Live" if po_ok else "\U0001f534 Offline"
-    text  = f"\U0001f44b Welcome, {name}!\n\n\U0001f4e1 OTC Signal Bot\nConnection: {conn}\n\nTap a button:"
-    if update.message:
-        await update.message.reply_text(text, reply_markup=_main_menu(chat_id))
-    else:
-        await update.callback_query.edit_message_text(text, reply_markup=_main_menu(chat_id))
+    await _show_main_menu(chat_id, update, context)
 
 async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -908,11 +1219,153 @@ async def menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("File sent.", reply_markup=_main_menu(chat_id))
 
 
+async def nav_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all nav:* callbacks for the Trading Smart Bot UI."""
+    query   = update.callback_query
+    await query.answer()
+    data    = query.data
+    chat_id = query.message.chat.id
+    known_users.add(chat_id)
+
+    # ── Home ─────────────────────────────────────────────────────────────
+    if data == "nav:home":
+        await _show_main_menu(chat_id, query, context)
+        return
+
+    # ── Asset list ────────────────────────────────────────────────────────
+    if data.startswith("nav:assets:"):
+        page = int(data.split(":")[-1])
+        rec  = _best_asset_recommendation(chat_id)
+        text = (
+            f"\U0001f4ca ASSETS\n"
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            f"\U0001f916 Bot recommendation: {rec}\n"
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            "Select an asset:"
+        )
+        await query.edit_message_text(text, reply_markup=_assets_keyboard(page))
+        return
+
+    # ── Timeframe selection ───────────────────────────────────────────────
+    if data.startswith("nav:tf:"):
+        asset_code = data[len("nav:tf:"):]
+        asset_label = next((k for k, v in {**ASSETS, **{a[0]: a[1] for p in ASSETS_UI_PAGES for a in p}}
+                            .items() if v == asset_code), asset_code)
+        text = (
+            f"\u23f1 CHOOSE TRADING TIME\n"
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            f"Asset: {asset_label}\n\n"
+            "Select the timeframe:"
+        )
+        await query.edit_message_text(text, reply_markup=_timeframe_keyboard(asset_code))
+        return
+
+    # ── Signal generation ─────────────────────────────────────────────────
+    if data.startswith("nav:signal:"):
+        parts      = data.split(":")
+        asset_code = parts[2]
+        tf_seconds = int(parts[3])
+        await _show_signal_screen(query, chat_id, asset_code, tf_seconds)
+        return
+
+    # ── How it works ──────────────────────────────────────────────────────
+    if data == "nav:howto":
+        text = (
+            "\U0001f916 How Trading Smart Bot works\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+            "\U0001f4ca Real market data from Pocket Option\n"
+            "The bot connects to Pocket Option via WebSocket and fetches live OHLC candle data.\n\n"
+            "\U0001f9e0 Hybrid strategy:\n"
+            "\u2022 RSI (14) \u2014 identifies overbought/oversold\n"
+            "\u2022 MACD (12/26/9) \u2014 confirms trend direction\n"
+            "\u2022 Bollinger Bands \u2014 detects ranging reversals\n\n"
+            "\U0001f3af Signal reliability:\n"
+            "Based on how strongly all indicators agree. Higher = more confident.\n\n"
+            "\U0001f4b0 HIGHER = CALL (price expected to rise)\n"
+            "\U0001f4c9 LOWER = PUT (price expected to fall)\n\n"
+            "\u26a0\ufe0f Signals are for informational purposes only."
+        )
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001f519 Back", callback_data="nav:home")
+        ]]))
+        return
+
+    # ── Ask a question ────────────────────────────────────────────────────
+    if data == "nav:ask":
+        await query.edit_message_text(
+            "\U0001f4ac Ask a question\n"
+            "\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n\n"
+            "For support, use /logs to see recent errors.\n"
+            "To update your SSID: /setssid\n"
+            "To refresh from Cloudflare: /refresh_ssid\n\n"
+            "All commands:\n"
+            "/signal \u2014 manual signal\n"
+            "/autoon / /autooff \u2014 toggle auto-signals\n"
+            "/scanner on/off \u2014 multi-asset scanner\n"
+            "/analyze \u2014 trade analytics\n"
+            "/account \u2014 live balance\n"
+            "/export \u2014 download trade CSV",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001f519 Back", callback_data="nav:home")
+            ]])
+        )
+        return
+
+    # ── Toggle auto ───────────────────────────────────────────────────────
+    if data == "nav:toggle_auto":
+        ps = _get_settings(chat_id)
+        ps["auto"] = not ps.get("auto", False)
+        state = "ON \u2705" if ps["auto"] else "OFF \U0001f515"
+        await query.answer(f"Auto-signals: {state}", show_alert=False)
+        await _show_main_menu(chat_id, query, context)
+        return
+
+    # ── Toggle scanner ────────────────────────────────────────────────────
+    if data == "nav:toggle_scanner":
+        ps = _get_settings(chat_id)
+        ps["scanner"] = not ps.get("scanner", False)
+        state = "ON \u2705" if ps["scanner"] else "OFF \U0001f515"
+        await query.answer(f"Scanner: {state}", show_alert=False)
+        await _show_main_menu(chat_id, query, context)
+        return
+
+    # ── Analyze ───────────────────────────────────────────────────────────
+    if data == "nav:analyze":
+        text = _build_analysis(chat_id)
+        if len(text) > 4000:
+            text = text[:3990] + "\n...(truncated)"
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001f519 Back", callback_data="nav:home")
+        ]]))
+        return
+
+    # ── Refresh SSID ──────────────────────────────────────────────────────
+    if data == "nav:refresh_ssid":
+        await query.edit_message_text("\u23f3 Fetching SSID from Worker...")
+        new_ssid = await fetch_ssid_from_worker()
+        if new_ssid and session_manager:
+            session_manager.ssid = new_ssid
+            async with session_manager._lock:
+                ok = await session_manager._connect()
+            msg = f"\u2705 SSID refreshed. UID: {_parse_uid(new_ssid)}" if ok else "\u274c Fetch OK but reconnect failed."
+        else:
+            msg = "\u274c Worker unavailable. Use /setssid manually."
+        await query.edit_message_text(msg, reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("\U0001f519 Back", callback_data="nav:home")
+        ]]))
+        return
+
+    # ── Noop ──────────────────────────────────────────────────────────────
+    if data == "nav:noop":
+        return
+
+
 # ---------------------------------------------------------------------------
 # Register handlers
 # ---------------------------------------------------------------------------
 telegram_app.add_handler(CallbackQueryHandler(vote_noop,    pattern="^vote:noop$"))
 telegram_app.add_handler(CallbackQueryHandler(vote_handler, pattern="^vote:(win|loss):"))
+telegram_app.add_handler(CallbackQueryHandler(nav_handler,  pattern="^nav:"))
 telegram_app.add_handler(CallbackQueryHandler(menu_handler, pattern="^m:"))
 telegram_app.add_handler(CommandHandler("start",        start))
 telegram_app.add_handler(CommandHandler("signal",       signal_command))
