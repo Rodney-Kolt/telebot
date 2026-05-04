@@ -410,15 +410,15 @@ def _make_signal_id(chat_id):
 
 def _vote_keyboard(signal_id):
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Win", callback_data=f"vote:win:{signal_id}"),
-        InlineKeyboardButton("Loss", callback_data=f"vote:loss:{signal_id}"),
+        InlineKeyboardButton("\U0001f44d Win",  callback_data=f"vote:win:{signal_id}"),
+        InlineKeyboardButton("\U0001f44e Loss", callback_data=f"vote:loss:{signal_id}"),
     ]])
 
 def _format_signal(result, asset_label, tf_label):
     d = result["direction"]
-    if d == "HIGHER": header = "BUY (CALL)"
-    elif d == "LOWER": header = "SELL (PUT)"
-    else: header = "WAIT - no clear signal"
+    if d == "HIGHER": header = "\U0001f4c8 BUY (CALL)"
+    elif d == "LOWER": header = "\U0001f4c9 SELL (PUT)"
+    else: header = "\u23f8 WAIT \u2014 no clear signal"
     rsi = result.get("rsi"); rsi_str = f"{rsi:.1f}" if rsi else "N/A"
     conf = result.get("confidence",0)
     bar  = chr(9608)*round(conf/20) + chr(9617)*(5-round(conf/20))
@@ -606,16 +606,16 @@ def _build_analysis(chat_id):
 # ---------------------------------------------------------------------------
 def _main_menu(chat_id):
     ps = _get_settings(chat_id)
-    auto_lbl    = "Auto-signals: ON"  if ps.get("auto")    else "Auto-signals: OFF"
-    scanner_lbl = "Scanner: ON"       if ps.get("scanner") else "Scanner: OFF"
+    auto_lbl    = "\U0001f514 Auto-signals: ON"  if ps.get("auto")    else "\U0001f515 Auto-signals: OFF"
+    scanner_lbl = "\U0001f4e1 Scanner: ON"        if ps.get("scanner") else "\U0001f4e1 Scanner: OFF"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Get Signal",    callback_data="m:signal")],
-        [InlineKeyboardButton(auto_lbl,        callback_data="m:toggle_auto"),
-         InlineKeyboardButton(scanner_lbl,     callback_data="m:toggle_scanner")],
-        [InlineKeyboardButton("Analyze",       callback_data="m:analyze"),
-         InlineKeyboardButton("Account",       callback_data="m:account")],
-        [InlineKeyboardButton("Refresh SSID",  callback_data="m:refresh_ssid"),
-         InlineKeyboardButton("Export CSV",    callback_data="m:export")],
+        [InlineKeyboardButton("\U0001f4ca Get Signal",    callback_data="m:signal")],
+        [InlineKeyboardButton(auto_lbl,                   callback_data="m:toggle_auto"),
+         InlineKeyboardButton(scanner_lbl,                callback_data="m:toggle_scanner")],
+        [InlineKeyboardButton("\U0001f4cb Analyze",       callback_data="m:analyze"),
+         InlineKeyboardButton("\U0001f4b0 Account",       callback_data="m:account")],
+        [InlineKeyboardButton("\U0001f511 Refresh SSID",  callback_data="m:refresh_ssid"),
+         InlineKeyboardButton("\U0001f4e4 Export CSV",    callback_data="m:export")],
     ])
 
 # ---------------------------------------------------------------------------
@@ -626,8 +626,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     known_users.add(chat_id)
     name = update.effective_user.first_name or "Trader"
     po_ok = session_manager is not None and session_manager.is_connected
-    conn  = "Live" if po_ok else "Offline"
-    text  = f"Welcome, {name}!\n\nOTC Signal Bot\nConnection: {conn}\n\nTap a button:"
+    conn  = "\U0001f7e2 Live" if po_ok else "\U0001f534 Offline"
+    text  = f"\U0001f44b Welcome, {name}!\n\n\U0001f4e1 OTC Signal Bot\nConnection: {conn}\n\nTap a button:"
     if update.message:
         await update.message.reply_text(text, reply_markup=_main_menu(chat_id))
     else:
@@ -809,12 +809,12 @@ async def vote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     signal["voted"] = True
     won = outcome == "win"
     _log_trade(user_id, signal, "win" if won else "loss")
-    label = "Win" if won else "Loss"
+    label = "Win \U0001f44d" if won else "Loss \U0001f44e"
     await query.answer(f"Recorded as {label}!")
     try:
         await query.edit_message_reply_markup(
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(f"Recorded: {label}", callback_data="vote:noop")
+                InlineKeyboardButton(f"\u2705 Recorded: {label}", callback_data="vote:noop")
             ]]))
     except Exception: pass
 
