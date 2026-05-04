@@ -282,6 +282,352 @@ def compute_signal(candles, timeframe_seconds=60):
 
 
 # ---------------------------------------------------------------------------
+# ADX indicator (pure Python, Wilder smoothing)
+# ---------------------------------------------------------------------------
+def _adx(candles, period=14):
+    """Return ADX value (0-100) or None if insufficient data."""
+    n = len(candles)
+    if n < period + 1: return None
+    sample = candles[-1]
+    if isinstance(sample, dict):
+        highs  = [float(c["high"])  for c in candles]
+        lows   = [float(c["low"])   for c in candles]
+        closes = [float(c["close"]) for c in candles]
+    else:
+        closes = _closes(candles)
+        highs = closes; lows = closes
+
+    tr_list, pdm_list, ndm_list = [], [], []
+    for i in range(1, n):
+        h, l, pc = highs[i], lows[i], closes[i-1]
+        tr  = max(h-l, abs(h-pc), abs(l-pc))
+        pdm = max(highs[i]-highs[i-1], 0) if (highs[i]-highs[i-1]) > (lows[i-1]-lows[i]) else 0
+        ndm = max(lows[i-1]-lows[i], 0)   if (lows[i-1]-lows[i]) > (highs[i]-highs[i-1]) else 0
+        tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
+
+    if len(tr_list) < period: return None
+
+    def _wilder(vals, p):
+        s = [sum(vals[:p])]
+        for v in vals[p:]: s.append(s[-1] - s[-1]/p + v)
+        return s
+
+    atr = _wilder(tr_list, period)
+    pdi = _wilder(pdm_list, period)
+    ndi = _wilder(ndm_list, period)
+
+    dx_list = []
+    for a, p, nd in zip(atr, pdi, ndi):
+        if a == 0: continue
+        pv = 100*p/a; nv = 100*nd/a
+        denom = pv + nv
+        dx_list.append(100*abs(pv-nv)/denom if denom else 0)
+
+    if len(dx_list) < period: return None
+    adx_series = _wilder(dx_list, period)
+    return round(adx_series[-1], 2)
+
+
+# ---------------------------------------------------------------------------
+# Advanced Analysis Mode
+# ---------------------------------------------------------------------------
+# Default env-var driven settings
+_DEFAULT_SHORT_TF      = int(os.environ.get("SHORT_TF",       "60"))
+_DEFAULT_LONG_TF       = int(os.environ.get("LONG_TF",        "300"))
+_DEFAULT_ANALYSIS_SECS = int(os.environ.get("ANALYSIS_SECONDS","60"))
+_DEFAULT_MIN_CONF      = int(os.environ.get("MIN_CONFIDENCE",  "70"))
+_STABILITY_DELAY       = int(os.environ.get("STABILITY_DELAY", "15"))
+_SAMPLE_INTERVAL       = 10   # seconds between samples during analysis window
+
+# Per-user advanced settings: {chat_id: {"advanced": bool, "analysis_secs": int,
+#                                         "short_tf": int, "long_tf": int}}
+advanced_settings: dict[int, dict] = {}
+# Active analysis tasks: {chat_id: asyncio.Task}
+_analysis_tasks: dict[int, asyncio.Task] = {}
+
+
+def _get_adv(chat_id: int) -> dict:
+    if chat_id not in advanced_settings:
+        advanced_settings[chat_id] = {
+            "advanced":      False,
+            "analysis_secs": _DEFAULT_ANALYSIS_SECS,
+            "short_tf":      _DEFAULT_SHORT_TF,
+            "long_tf":       _DEFAULT_LONG_TF,
+            "min_conf":      _DEFAULT_MIN_CONF,
+        }
+    return advanced_settings[chat_id]
+
+
+async def _run_advanced_analysis(
+    chat_id: int,
+    asset_code: str,
+    asset_label: str,
+    tf_label: str,
+    notify_msg_id: int | None = None,
+) -> None:
+    """
+    Full advanced analysis loop:
+    1. Observe market for analysis_secs, sampling every _SAMPLE_INTERVAL seconds.
+    2. Require multi-TF agreement on every sample.
+    3. Apply ADX regime filter.
+    4. Wait stability_delay after first signal, re-check.
+    5. Send signal only if confidence >= min_conf.
+    """
+    adv = _get_adv(chat_id)
+    analysis_secs = adv["analysis_secs"]
+    short_tf      = adv["short_tf"]
+    long_tf       = adv["long_tf"]
+    min_conf      = adv["min_conf"]
+
+    samples_total   = max(1, analysis_secs // _SAMPLE_INTERVAL)
+    bullish_samples = 0
+    bearish_samples = 0
+    price_high      = None
+    price_low       = None
+    last_conf       = 0
+    last_direction  = "WAIT"
+
+    logger.info(f"[Advanced] Starting {analysis_secs}s analysis for {asset_code} (chat={chat_id})")
+
+    for sample_i in range(samples_total):
+        await asyncio.sleep(_SAMPLE_INTERVAL)
+
+        if not (session_manager and session_manager.is_connected):
+            break
+
+        # Fetch both timeframes
+        short_candles = await session_manager.get_candles(asset_code, short_tf, CANDLE_COUNT)
+        long_candles  = await session_manager.get_candles(asset_code, long_tf,  CANDLE_COUNT)
+
+        if not short_candles or len(short_candles) < 22:
+            continue
+
+        # Track price range for volatility
+        try:
+            c = short_candles[-1]
+            price = float(c["close"] if isinstance(c, dict) else c.close)
+            if price_high is None: price_high = price_low = price
+            price_high = max(price_high, price)
+            price_low  = min(price_low,  price)
+        except Exception:
+            price = None
+
+        # Compute signals on both TFs
+        short_result = compute_signal(short_candles, short_tf)
+        long_result  = compute_signal(long_candles,  long_tf) if long_candles and len(long_candles) >= 22 else {"direction": "WAIT"}
+
+        short_dir = short_result["direction"]
+        long_dir  = long_result["direction"]
+
+        # ADX regime filter on short TF
+        adx_val = _adx(short_candles)
+        if adx_val is not None:
+            if 20 <= adx_val <= 25:
+                # Weak regime — skip this sample
+                logger.debug(f"[Advanced] ADX={adx_val:.1f} weak zone, skipping sample {sample_i+1}")
+                continue
+            if adx_val > 25 and short_result.get("strategy","") == "BB-Ranging":
+                continue   # trend regime but got reversal signal — skip
+            if adx_val < 20 and short_result.get("strategy","") == "MACD+RSI":
+                continue   # ranging regime but got trend signal — skip
+
+        # Multi-TF agreement check
+        if short_dir == "HIGHER" and long_dir in ("HIGHER", "WAIT"):
+            bullish_samples += 1
+            last_direction = "HIGHER"
+            last_conf = short_result.get("confidence", 70)
+        elif short_dir == "LOWER" and long_dir in ("LOWER", "WAIT"):
+            bearish_samples += 1
+            last_direction = "LOWER"
+            last_conf = short_result.get("confidence", 70)
+
+        logger.debug(f"[Advanced] Sample {sample_i+1}/{samples_total}: "
+                     f"short={short_dir} long={long_dir} "
+                     f"bull={bullish_samples} bear={bearish_samples}")
+
+    # ── Decision after observation window ────────────────────────────────
+    consistency_threshold = 0.7   # 70% of samples must agree
+    bull_ratio = bullish_samples / samples_total
+    bear_ratio = bearish_samples / samples_total
+
+    if bull_ratio >= consistency_threshold:
+        candidate_dir = "HIGHER"
+        consistency   = bull_ratio
+    elif bear_ratio >= consistency_threshold:
+        candidate_dir = "LOWER"
+        consistency   = bear_ratio
+    else:
+        logger.info(f"[Advanced] No consistent signal for {asset_code} "
+                    f"(bull={bull_ratio:.0%} bear={bear_ratio:.0%})")
+        if notify_msg_id:
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=notify_msg_id,
+                    text=f"\u274c No signal found for {asset_label} after {analysis_secs}s analysis.\n"
+                         f"(bull={bull_ratio:.0%} bear={bear_ratio:.0%} — need \u226570%)"
+                )
+            except Exception: pass
+        _analysis_tasks.pop(chat_id, None)
+        return
+
+    # ── Stability re-check after STABILITY_DELAY ─────────────────────────
+    logger.info(f"[Advanced] Candidate {candidate_dir} ({consistency:.0%}). "
+                f"Waiting {_STABILITY_DELAY}s for stability check...")
+    if notify_msg_id:
+        try:
+            await telegram_app.bot.edit_message_text(
+                chat_id=chat_id, message_id=notify_msg_id,
+                text=f"\u23f3 Candidate signal: {candidate_dir}\n"
+                     f"Stability check in {_STABILITY_DELAY}s..."
+            )
+        except Exception: pass
+
+    await asyncio.sleep(_STABILITY_DELAY)
+
+    if not (session_manager and session_manager.is_connected):
+        _analysis_tasks.pop(chat_id, None)
+        return
+
+    recheck_candles = await session_manager.get_candles(asset_code, short_tf, CANDLE_COUNT)
+    recheck_result  = compute_signal(recheck_candles, short_tf) if recheck_candles else {"direction": "WAIT"}
+    stability_bonus = 10 if recheck_result["direction"] == candidate_dir else 0
+
+    if recheck_result["direction"] != candidate_dir:
+        logger.info(f"[Advanced] Stability check FAILED — signal reversed to {recheck_result['direction']}")
+        if notify_msg_id:
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=notify_msg_id,
+                    text=f"\u274c Signal rejected: condition changed during stability check.\n"
+                         f"({candidate_dir} \u2192 {recheck_result['direction']})"
+                )
+            except Exception: pass
+        _analysis_tasks.pop(chat_id, None)
+        return
+
+    # ── Composite confidence score ────────────────────────────────────────
+    base_conf    = recheck_result.get("confidence", 70)
+    tf_bonus     = 15 if consistency >= 0.85 else 8
+    final_conf   = min(97, int(base_conf + tf_bonus + stability_bonus))
+
+    # Volatility penalty
+    vol_warning = ""
+    if price_high and price_low and price_low > 0:
+        price_range_pct = (price_high - price_low) / price_low * 100
+        if price_range_pct > 0.2:
+            final_conf  = max(55, final_conf - 10)
+            vol_warning = f"\n\u26a0\ufe0f High volatility during analysis ({price_range_pct:.3f}%)"
+
+    if final_conf < min_conf:
+        logger.info(f"[Advanced] Confidence {final_conf}% < min {min_conf}% — signal suppressed")
+        if notify_msg_id:
+            try:
+                await telegram_app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=notify_msg_id,
+                    text=f"\u274c Signal suppressed: confidence {final_conf}% < minimum {min_conf}%"
+                )
+            except Exception: pass
+        _analysis_tasks.pop(chat_id, None)
+        return
+
+    # ── Send confirmed signal ─────────────────────────────────────────────
+    recheck_result["confidence"] = final_conf
+    price_str = ""
+    if recheck_candles:
+        try:
+            c = recheck_candles[-1]
+            p = float(c["close"] if isinstance(c, dict) else c.close)
+            price_str = f"{p:.5f}"
+        except Exception: pass
+
+    confirmation_note = (
+        f"\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+        f"\u2705 Signal confirmed after full analysis\n"
+        f"Checked 2 timeframes ({short_tf}s + {long_tf}s)\n"
+        f"Observed {analysis_secs}s ({consistency:.0%} consistent)\n"
+        f"Stability check: passed (+{stability_bonus}%)\n"
+        f"Final confidence: {final_conf}%{vol_warning}"
+    )
+
+    # Edit the waiting message first
+    if notify_msg_id:
+        try:
+            await telegram_app.bot.edit_message_text(
+                chat_id=chat_id, message_id=notify_msg_id,
+                text=f"\u2705 Analysis complete — sending signal..."
+            )
+        except Exception: pass
+
+    # Send the actual signal
+    signal_id = _make_signal_id(chat_id)
+    pending_signals[signal_id] = {
+        "user_id": chat_id, "ts": time.time(), "voted": False,
+        "asset_label": asset_label, "tf_label": tf_label,
+        "direction": "CALL" if candidate_dir == "HIGHER" else "PUT",
+        "confidence": final_conf, "rsi": recheck_result.get("rsi",""),
+        "price": price_str, "market": recheck_result.get("market",""),
+        "reason": recheck_result.get("reason","") + confirmation_note,
+    }
+
+    img = SIGNAL_IMG_BUY if candidate_dir == "HIGHER" else SIGNAL_IMG_SELL
+    caption = _signal_caption(recheck_result, asset_label, tf_label, price_str) + confirmation_note
+    keyboard = _vote_keyboard(signal_id)
+
+    if img:
+        try:
+            await telegram_app.bot.send_photo(chat_id=chat_id, photo=img,
+                caption=caption, reply_markup=keyboard)
+            _analysis_tasks.pop(chat_id, None)
+            return
+        except Exception: pass
+
+    text = _format_signal(recheck_result, asset_label, tf_label)
+    text += f"\nPrice: {price_str}" if price_str else ""
+    text += confirmation_note
+    await telegram_app.bot.send_message(chat_id=chat_id, text=text, reply_markup=keyboard)
+    _analysis_tasks.pop(chat_id, None)
+
+
+async def trigger_advanced_analysis(
+    chat_id: int,
+    asset_code: str,
+    asset_label: str,
+    tf_label: str = "1 minute",
+) -> None:
+    """
+    Start an advanced analysis task for a user.
+    Cancels any existing analysis for that user first.
+    """
+    # Cancel existing
+    existing = _analysis_tasks.get(chat_id)
+    if existing and not existing.done():
+        existing.cancel()
+
+    adv = _get_adv(chat_id)
+    analysis_secs = adv["analysis_secs"]
+
+    # Send the "analysing..." message
+    sent = await telegram_app.bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"\u23f3 Advanced Analysis Mode\n"
+            f"\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"
+            f"Asset: {asset_label}\n"
+            f"Observing market for {analysis_secs}s...\n"
+            f"Timeframes: {adv['short_tf']}s + {adv['long_tf']}s\n"
+            f"Min confidence: {adv['min_conf']}%\n\n"
+            "Please wait. No signal will be sent until analysis is complete."
+        )
+    )
+
+    task = asyncio.create_task(
+        _run_advanced_analysis(chat_id, asset_code, asset_label, tf_label, sent.message_id),
+        name=f"adv_{chat_id}",
+    )
+    _analysis_tasks[chat_id] = task
+
+
+# ---------------------------------------------------------------------------
 # Cloudflare Worker SSID relay
 # ---------------------------------------------------------------------------
 async def fetch_ssid_from_worker():
@@ -499,8 +845,17 @@ async def _poll_loop():
                     for cid in list(known_users):
                         ps = _get_settings(cid)
                         if ps.get("auto", False):
-                            await _send_signal_message(cid, result, "EUR/USD (OTC)",
-                                                        "1 minute", price_str)
+                            adv = _get_adv(cid)
+                            if adv.get("advanced"):
+                                # Advanced mode: only trigger if no analysis running
+                                if cid not in _analysis_tasks or _analysis_tasks[cid].done():
+                                    asyncio.create_task(
+                                        trigger_advanced_analysis(cid, "EURUSD_otc", "EUR/USD (OTC)", "1 minute"),
+                                        name=f"adv_auto_{cid}"
+                                    )
+                            else:
+                                await _send_signal_message(cid, result, "EUR/USD (OTC)",
+                                                            "1 minute", price_str)
 
         except Exception as exc:
             log_error(f"Poll loop error: {exc}")
@@ -826,6 +1181,21 @@ async def _show_signal_screen(query, chat_id: int, asset_code: str, tf_seconds: 
     candles = await session_manager.get_candles(asset_code, max(tf_seconds, 60), CANDLE_COUNT)
     result  = compute_signal(candles, tf_seconds)
 
+    # If advanced mode is on, trigger full analysis instead
+    adv = _get_adv(chat_id)
+    if adv.get("advanced"):
+        await query.edit_message_text(
+            f"\u23f3 Advanced mode active — starting {adv['analysis_secs']}s analysis for {asset_label}...",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("\U0001f519 Back", callback_data="nav:assets:0")
+            ]])
+        )
+        asyncio.create_task(
+            trigger_advanced_analysis(chat_id, asset_code, asset_label, tf_label),
+            name=f"adv_nav_{chat_id}"
+        )
+        return
+
     price = None
     if candles:
         try:
@@ -950,6 +1320,14 @@ async def signal_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (session_manager and session_manager.is_connected):
         await update.message.reply_text("Not connected. Use /setssid to connect.")
         return
+
+    adv = _get_adv(chat_id)
+    if adv.get("advanced"):
+        # Advanced mode: trigger delayed multi-TF analysis
+        await trigger_advanced_analysis(chat_id, "EURUSD_otc", "EUR/USD (OTC)", "1 minute")
+        return
+
+    # Simple mode: instant signal
     await update.message.reply_text("Fetching signal for EUR/USD (OTC)...")
     candles = await session_manager.get_candles("EURUSD_otc", 60, CANDLE_COUNT)
     result  = compute_signal(candles, 60)
@@ -1360,6 +1738,108 @@ async def nav_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def advanced_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle advanced analysis mode. Usage: /advanced on | /advanced off"""
+    chat_id = update.effective_chat.id
+    adv = _get_adv(chat_id)
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1: args = parts[1:]
+
+    if not args:
+        on = adv.get("advanced", False)
+        await update.message.reply_text(
+            f"\U0001f9e0 Advanced Analysis Mode: {'ON \u2705' if on else 'OFF \U0001f515'}\n\n"
+            f"Analysis window: {adv['analysis_secs']}s\n"
+            f"Timeframes: {adv['short_tf']}s (short) + {adv['long_tf']}s (long)\n"
+            f"Min confidence: {adv['min_conf']}%\n\n"
+            "Commands:\n"
+            "  /advanced on|off\n"
+            "  /set_analysis <seconds>\n"
+            "  /set_timeframes <short> <long>"
+        )
+        return
+
+    if args[0].lower() == "on":
+        adv["advanced"] = True
+        await update.message.reply_text(
+            "\U0001f9e0 Advanced Analysis Mode ENABLED \u2705\n\n"
+            f"The bot will now observe the market for {adv['analysis_secs']}s,\n"
+            f"check {adv['short_tf']}s and {adv['long_tf']}s timeframes,\n"
+            f"apply ADX regime filter, and only send signals with \u2265{adv['min_conf']}% confidence.\n\n"
+            "Use /simple to revert to instant signals."
+        )
+    elif args[0].lower() == "off":
+        adv["advanced"] = False
+        await update.message.reply_text(
+            "\U0001f4ca Simple Mode ENABLED\n"
+            "Signals are generated instantly without multi-TF analysis.\n"
+            "Use /advanced on to re-enable."
+        )
+    else:
+        await update.message.reply_text("Usage: /advanced on  or  /advanced off")
+
+
+async def simple_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shortcut to disable advanced mode."""
+    _get_adv(update.effective_chat.id)["advanced"] = False
+    await update.message.reply_text(
+        "\U0001f4ca Simple Mode enabled.\nSignals are generated instantly."
+    )
+
+
+async def set_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the analysis observation window. Usage: /set_analysis <seconds>"""
+    chat_id = update.effective_chat.id
+    adv = _get_adv(chat_id)
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1: args = parts[1:]
+    if not args:
+        await update.message.reply_text(
+            f"Current analysis window: {adv['analysis_secs']}s\n"
+            "Usage: /set_analysis <seconds>  (e.g. /set_analysis 90)"
+        )
+        return
+    try:
+        secs = int(args[0])
+        if secs < 20 or secs > 300:
+            await update.message.reply_text("Value must be between 20 and 300 seconds.")
+            return
+        adv["analysis_secs"] = secs
+        await update.message.reply_text(f"\u2705 Analysis window set to {secs}s.")
+    except ValueError:
+        await update.message.reply_text("Invalid value. Usage: /set_analysis 60")
+
+
+async def set_timeframes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set short and long timeframes. Usage: /set_timeframes <short_secs> <long_secs>"""
+    chat_id = update.effective_chat.id
+    adv = _get_adv(chat_id)
+    args = context.args or []
+    if not args and update.message and update.message.text:
+        parts = update.message.text.strip().split()
+        if len(parts) > 1: args = parts[1:]
+    if len(args) < 2:
+        await update.message.reply_text(
+            f"Current: short={adv['short_tf']}s  long={adv['long_tf']}s\n"
+            "Usage: /set_timeframes <short> <long>\n"
+            "Example: /set_timeframes 60 300"
+        )
+        return
+    try:
+        short = int(args[0]); long_ = int(args[1])
+        if short >= long_:
+            await update.message.reply_text("Short TF must be less than long TF.")
+            return
+        adv["short_tf"] = short; adv["long_tf"] = long_
+        await update.message.reply_text(f"\u2705 Timeframes set: {short}s (short) + {long_}s (long).")
+    except ValueError:
+        await update.message.reply_text("Invalid values. Usage: /set_timeframes 60 300")
+
+
 # ---------------------------------------------------------------------------
 # Register handlers
 # ---------------------------------------------------------------------------
@@ -1368,7 +1848,11 @@ telegram_app.add_handler(CallbackQueryHandler(vote_handler, pattern="^vote:(win|
 telegram_app.add_handler(CallbackQueryHandler(nav_handler,  pattern="^nav:"))
 telegram_app.add_handler(CallbackQueryHandler(menu_handler, pattern="^m:"))
 telegram_app.add_handler(CommandHandler("start",        start))
-telegram_app.add_handler(CommandHandler("signal",       signal_command))
+telegram_app.add_handler(CommandHandler("signal",          signal_command))
+telegram_app.add_handler(CommandHandler("advanced",        advanced_command))
+telegram_app.add_handler(CommandHandler("simple",          simple_command))
+telegram_app.add_handler(CommandHandler("set_analysis",    set_analysis_command))
+telegram_app.add_handler(CommandHandler("set_timeframes",  set_timeframes_command))
 telegram_app.add_handler(CommandHandler("autoon",       autoon_command))
 telegram_app.add_handler(CommandHandler("autooff",      autooff_command))
 telegram_app.add_handler(CommandHandler("scanner",      scanner_command))
